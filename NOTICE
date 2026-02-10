@@ -1,0 +1,20 @@
+Aillium UI-TARS (IntAillium)
+===========================
+
+This repository is a fork and contains modifications for the Aillium platform.
+
+Upstream projects included and/or derived from:
+
+1) UI-TARS Desktop
+   Copyright (c) ByteDance and contributors
+   License: Apache License 2.0
+   Source: https://github.com/bytedance/UI-TARS-desktop
+
+2) MeshCentral (vendored via git subtree into vendor/meshcentral)
+   Copyright (c) Ylianst and contributors
+   License: Apache License 2.0
+   Source: https://github.com/Ylianst/MeshCentral
+
+Notes:
+- MeshCentral is included as a remote-connectivity substrate and is not exposed as a standalone executor.
+- This NOTICE file is provided for attribution and license compliance purposes.
