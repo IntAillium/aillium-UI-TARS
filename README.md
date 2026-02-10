@@ -3,9 +3,59 @@
 </p>
 
 # UI-TARS: Pioneering Automated GUI Interaction with Native Agents -->
+
 ![Local Image](figures/writer.png)
 <div align="center">
-<p>
+
+# Aillium UI-TARS
+
+Aillium UI-TARS is the **UI execution worker** for the Aillium platform by IntAillium.
+
+This service is an **executor** (the “hands”), not a planner:
+- It **does not** decide what to do.
+- It **does not** create plans.
+- It **does not** perform business decision-making.
+- It **only** executes **approved**, **tenant-scoped** work instructions produced upstream.
+
+## Role in the Aillium Architecture
+
+Aillium UI-TARS runs in the Execution Plane and follows the canonical contracts in `aillium-schemas`:
+
+- **Input:** `executor.request`
+- **Output:** `executor.response`
+- **Evidence:** artifacts + pointers suitable for audit indexing
+
+It must obey:
+- `tenantId` scoping (hard boundary)
+- policy/tool allowances embedded in the request
+- budget/runtime caps (if provided)
+- strict audit/evidence requirements
+
+## Remote Access Substrate
+
+This repo vendors **MeshCentral** under:
+
+- `vendor/meshcentral`
+
+MeshCentral is treated as an **internal capability** used by UI-TARS to securely interact with client devices when required. MeshCentral is **not** a standalone executor and is not called directly by the Control Plane.
+
+## What This Worker Must NOT Do
+
+- No planning/orchestration logic (belongs in `aillium-openclaw`)
+- No source-of-truth state (belongs in `aillium-core`)
+- No direct billing computation (usage reporting only, if required by contract)
+- No UI for end users (client/staff UI belongs in `aillium-portal`)
+- No hardcoded secrets (all configuration via environment/secret stores)
+
+## Upstream Origin
+
+This repository is based on upstream projects:
+- UI-TARS Desktop: https://github.com/bytedance/UI-TARS-desktop
+- MeshCentral: https://github.com/Ylianst/MeshCentral
+
+See `LICENSE` and `NOTICE` for attribution and licensing details.
+  
+  <p>
         🌐 <a href="https://seed-tars.com/">Website</a>&nbsp&nbsp | 🤗 <a href="https://huggingface.co/ByteDance-Seed/UI-TARS-1.5-7B">Hugging Face Models</a>&nbsp&nbsp 
         | &nbsp&nbsp 🔧 <a href="README_deploy.md">Deployment</a> &nbsp&nbsp  | &nbsp&nbsp 📑 <a href="https://arxiv.org/abs/2501.12326">Paper</a> &nbsp&nbsp  |&nbsp&nbsp</a>
 🖥️ <a href="https://github.com/bytedance/UI-TARS-desktop">UI-TARS-desktop</a>&nbsp&nbsp  <br>🏄 <a href="https://github.com/web-infra-dev/Midscene">Midscene (Browser Automation) </a>&nbsp&nbsp | &nbsp&nbsp🫨 <a href="https://discord.gg/pTXwYVjfcs">Discord</a>&nbsp&nbsp
