@@ -12,6 +12,7 @@ from jsonschema.exceptions import ValidationError
 
 from .audit import Correlation, emit, setup_logging
 from .dry_run import build_dry_run_response
+from .remote_handshake import RemoteHandshakeValidationError, execute_remote_handshake
 from .schema_loader import SchemaLoadError, load_schemas
 
 
@@ -48,7 +49,7 @@ def _corr_from_payload_and_headers(payload: dict[str, Any], headers) -> Correlat
 def create_handler(context: AppContext):
     class ExecutorHandler(BaseHTTPRequestHandler):
         def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler signature
-            if self.path != "/executor/dry-run":
+            if self.path not in {"/executor/dry-run", "/executor/remote-handshake"}:
                 _json_headers(self, HTTPStatus.NOT_FOUND)
                 self.wfile.write(json.dumps({"error": "not_found"}).encode("utf-8"))
                 return
@@ -64,30 +65,40 @@ def create_handler(context: AppContext):
                 context.request_validator.validate(payload)
                 emit("executor.request.validated", correlation, validation="passed")
 
-                response_payload = build_dry_run_response(
-                    request_payload=payload,
-                    response_schema=context.response_schema,
-                    headers={k.lower(): v for k, v in self.headers.items()},
-                )
+                if self.path == "/executor/dry-run":
+                    response_payload = build_dry_run_response(
+                        request_payload=payload,
+                        response_schema=context.response_schema,
+                        headers={k.lower(): v for k, v in self.headers.items()},
+                    )
+                else:
+                    response_payload = execute_remote_handshake(
+                        request_payload=payload,
+                        request_validator=context.request_validator,
+                        response_schema=context.response_schema,
+                        headers={k.lower(): v for k, v in self.headers.items()},
+                    )
                 emit("executor.response.validated", correlation, validation="passed")
                 _json_headers(self, HTTPStatus.OK)
                 self.wfile.write(json.dumps(response_payload).encode("utf-8"))
-            except ValidationError as exc:
+            except (ValidationError, RemoteHandshakeValidationError) as exc:
+                schema_path = list(exc.schema_path) if isinstance(exc, ValidationError) else []
+                instance_path = list(exc.path) if isinstance(exc, ValidationError) else []
                 emit(
                     "executor.request.validation_failed",
                     correlation,
-                    message=exc.message,
-                    schemaPath=list(exc.schema_path),
-                    instancePath=list(exc.path),
+                    message=exc.args[0] if exc.args else str(exc),
+                    schemaPath=schema_path,
+                    instancePath=instance_path,
                 )
                 _json_headers(self, HTTPStatus.BAD_REQUEST)
                 self.wfile.write(
                     json.dumps(
                         {
                             "error": "request_schema_validation_failed",
-                            "message": exc.message,
-                            "schemaPath": list(exc.schema_path),
-                            "instancePath": list(exc.path),
+                            "message": exc.args[0] if exc.args else str(exc),
+                            "schemaPath": schema_path,
+                            "instancePath": instance_path,
                         }
                     ).encode("utf-8")
                 )
