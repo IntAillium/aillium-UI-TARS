@@ -4,6 +4,7 @@ This repository is part of the Aillium platform.
 
 Automated agents and AI tools must follow these rules:
 
+- Treat Aillium platform documentation and `aillium-schemas` as the single source of truth
 - Do not introduce new architecture patterns without approval
 - Do not bypass policy, audit, or approval mechanisms
 - Do not add hardcoded credentials
@@ -76,6 +77,7 @@ The following are **strictly forbidden** in this repository:
 - Accepts plans **only from `aillium-core`**
 - Rejects unsigned, malformed, or out-of-contract payloads
 - Never pulls work directly from OpenClaw
+- Enforces tenant-scoped execution boundaries on every request
 
 ### Evidence First
 - Capture UI evidence wherever possible
