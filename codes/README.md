@@ -144,3 +144,51 @@ Contributions, issues, and suggestions are welcome!
 ## License
 
 Apache-2.0 License
+
+---
+
+## Aillium Executor Dry-Run (A-5a MVP)
+
+This repository now includes an HTTP dry-run executor endpoint for contract validation and deterministic mock execution.
+
+### Behavior
+
+- Endpoint: `POST /executor/dry-run`
+- Validates input against `executor.request` from `aillium-schemas`
+- Produces `executor.response` payload validated against `aillium-schemas`
+- Dry-run only: no real UI automation, no OS input, no browser sessions, no MeshCentral sessions
+- Structured JSON audit logs include correlation IDs where present (`tenantId`, `requestId`, `traceId`)
+
+### Schema source of truth
+
+Schemas are loaded from installed package resources of:
+
+- `aillium-schemas @ git+https://github.com/IntAillium/aillium-schemas.git@v0.1.0`
+
+No schema JSON is vendored in this repository.
+
+### Run
+
+```bash
+cd codes
+python -m ui_tars.executor.server
+```
+
+Optional environment variables:
+
+- `EXECUTOR_HOST` (default `0.0.0.0`)
+- `EXECUTOR_PORT` (default `8080`)
+- `AILLIUM_SCHEMAS_OVERRIDE_DIR` (test/dev override path; production should use installed package resources)
+
+### Example request
+
+```bash
+curl -sS -X POST http://localhost:8080/executor/dry-run \
+  -H 'content-type: application/json' \
+  -H 'x-trace-id: trace-123' \
+  -d '{
+    "tenantId": "tenant-001",
+    "requestId": "req-001",
+    "meta": {"simulate_failure": false}
+  }'
+```
