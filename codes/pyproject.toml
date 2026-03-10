@@ -9,18 +9,18 @@ authors = [
 ]
 requires-python = ">=3.10,<4.0"
 dependencies = [
-<<<<<<< Updated upstream
     "jsonschema>=4.23.0",
     "aillium-schemas @ git+https://github.com/IntAillium/aillium-schemas.git@v0.1.0",
-=======
     "pillow>=11.2.1",
     "matplotlib>=3.10.3",
->>>>>>> Stashed changes
 ]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.envs.test.scripts]
 test = "python -m unittest discover tests '*_test.py'"
