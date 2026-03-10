@@ -12,6 +12,8 @@ from jsonschema.exceptions import ValidationError
 
 from .audit import Correlation, emit, setup_logging
 from .dry_run import build_dry_run_response
+from .meshcentral_client import MeshCentralClient
+from .remote_handshake import HandshakeValidationError, handle_remote_handshake
 from .schema_loader import SchemaLoadError, load_schemas
 
 
@@ -40,7 +42,9 @@ def _corr_from_payload_and_headers(payload: dict[str, Any], headers) -> Correlat
     meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
     return Correlation(
         tenant_id=(payload.get("tenantId") or meta.get("tenantId") or headers.get("x-tenant-id")),
-        request_id=(payload.get("requestId") or meta.get("requestId") or headers.get("x-request-id")),
+        request_id=(
+            payload.get("requestId") or meta.get("requestId") or headers.get("x-request-id")
+        ),
         trace_id=(payload.get("traceId") or meta.get("traceId") or headers.get("x-trace-id")),
     )
 
@@ -48,7 +52,7 @@ def _corr_from_payload_and_headers(payload: dict[str, Any], headers) -> Correlat
 def create_handler(context: AppContext):
     class ExecutorHandler(BaseHTTPRequestHandler):
         def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler signature
-            if self.path != "/executor/dry-run":
+            if self.path not in ("/executor/dry-run", "/executor/remote-handshake"):
                 _json_headers(self, HTTPStatus.NOT_FOUND)
                 self.wfile.write(json.dumps({"error": "not_found"}).encode("utf-8"))
                 return
@@ -61,17 +65,57 @@ def create_handler(context: AppContext):
                 correlation = _corr_from_payload_and_headers(payload, self.headers)
                 emit("executor.request.received", correlation, path=self.path)
 
+                # Validate request against canonical executor.request schema
                 context.request_validator.validate(payload)
                 emit("executor.request.validated", correlation, validation="passed")
 
-                response_payload = build_dry_run_response(
-                    request_payload=payload,
-                    response_schema=context.response_schema,
-                    headers={k.lower(): v for k, v in self.headers.items()},
+                if self.path == "/executor/dry-run":
+                    response_payload = build_dry_run_response(
+                        request_payload=payload,
+                        response_schema=context.response_schema,
+                        headers={k.lower(): v for k, v in self.headers.items()},
+                    )
+                    emit("executor.response.validated", correlation, validation="passed")
+                    _json_headers(self, HTTPStatus.OK)
+                    self.wfile.write(json.dumps(response_payload).encode("utf-8"))
+                    return
+
+                if self.path == "/executor/remote-handshake":
+                    # Orchestrate remote handshake (connectivity only; no execution)
+                    response_payload = handle_remote_handshake(
+                        request=payload,
+                        client=MeshCentralClient.from_env(),
+                    )
+
+                    # Validate response against canonical executor.response schema
+                    Draft202012Validator(context.response_schema).validate(response_payload)
+                    emit("executor.response.validated", correlation, validation="passed")
+
+                    _json_headers(self, HTTPStatus.OK)
+                    self.wfile.write(json.dumps(response_payload).encode("utf-8"))
+                    return
+
+                # Defensive fallback (should never happen due to earlier path check)
+                _json_headers(self, HTTPStatus.NOT_FOUND)
+                self.wfile.write(json.dumps({"error": "not_found"}).encode("utf-8"))
+
+            except HandshakeValidationError as exc:
+                emit(
+                    "executor.request.validation_failed",
+                    correlation,
+                    message=str(exc),
+                    kind="handshake_validation_error",
                 )
-                emit("executor.response.validated", correlation, validation="passed")
-                _json_headers(self, HTTPStatus.OK)
-                self.wfile.write(json.dumps(response_payload).encode("utf-8"))
+                _json_headers(self, HTTPStatus.BAD_REQUEST)
+                self.wfile.write(
+                    json.dumps(
+                        {
+                            "error": "handshake_validation_failed",
+                            "message": str(exc),
+                        }
+                    ).encode("utf-8")
+                )
+
             except ValidationError as exc:
                 emit(
                     "executor.request.validation_failed",
@@ -91,8 +135,14 @@ def create_handler(context: AppContext):
                         }
                     ).encode("utf-8")
                 )
+
             except Exception as exc:
-                emit("executor.request.failed", correlation, error=str(exc), errorType=type(exc).__name__)
+                emit(
+                    "executor.request.failed",
+                    correlation,
+                    error=str(exc),
+                    errorType=type(exc).__name__,
+                )
                 _json_headers(self, HTTPStatus.INTERNAL_SERVER_ERROR)
                 self.wfile.write(
                     json.dumps({"error": "internal_executor_error", "message": str(exc)}).encode(
@@ -132,7 +182,7 @@ def run() -> None:
     host = os.getenv("EXECUTOR_HOST", "0.0.0.0")
     port = int(os.getenv("EXECUTOR_PORT", "8080"))
     server = ThreadingHTTPServer((host, port), create_handler(context))
-    print(f"Executor dry-run server listening on http://{host}:{port}")
+    print(f"Executor server listening on http://{host}:{port}")
     server.serve_forever()
 
 
