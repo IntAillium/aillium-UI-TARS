@@ -9,10 +9,10 @@ authors = [
 ]
 requires-python = ">=3.10,<4.0"
 dependencies = [
-    "jsonschema>=4.23.0",
-    "aillium-schemas @ git+https://github.com/IntAillium/aillium-schemas.git@v0.1.0",
-    "pillow>=11.2.1",
-    "matplotlib>=3.10.3",
+  "jsonschema>=4.23.0",
+  "aillium-schemas @ git+https://github.com/IntAillium/aillium-schemas.git@2ee06ed3a2bf86e4db4188dbd81fcd1026344d49#subdirectory=packages/python",
+  "pillow>=11.2.1",
+  "matplotlib>=3.10.3",
 ]
 
 [build-system]
