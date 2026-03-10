@@ -33,11 +33,11 @@ It must obey:
 
 ## Remote Access Substrate
 
-This repo vendors **MeshCentral** under:
+Remote connectivity for endpoint access is provided by the separate Aillium remote substrate repository:
 
-- `vendor/meshcentral`
+- **aillium-remote-meshcentral**
 
-MeshCentral is treated as an **internal capability** used by UI-TARS to securely interact with client devices when required. MeshCentral is **not** a standalone executor and is not called directly by the Control Plane.
+MeshCentral is treated as an internal remote-connectivity substrate used by UI-TARS to securely interact with client devices when required. MeshCentral is **not** a standalone executor and is not called directly by the Control Plane.
 
 ## What This Worker Must NOT Do
 
@@ -49,9 +49,11 @@ MeshCentral is treated as an **internal capability** used by UI-TARS to securely
 
 ## Upstream Origin
 
-This repository is based on upstream projects:
+This repository is based on upstream UI-TARS:
 - UI-TARS Desktop: https://github.com/bytedance/UI-TARS-desktop
-- MeshCentral: https://github.com/Ylianst/MeshCentral
+
+Remote substrate used by this worker:
+- MeshCentral (via **aillium-remote-meshcentral**): https://github.com/Ylianst/MeshCentral
 
 See `LICENSE` and `NOTICE` for attribution and licensing details.
   
@@ -94,12 +96,10 @@ Leveraging the foundational architecture introduced in [our recent paper](https:
 
 To help you get started quickly with our model, we recommend following the steps below in order. These steps will guide you through deployment, prediction post-processing to make the model take actions in your environment.
 
-
 ### ✅ Step 1: Deployment & Inference
 
 👉 <a href="README_deploy.md">Deployment and Inference</a>.
 This includes instructions for model deployment using huggingface endpoint, and running your first prediction.
-
 
 ### ✅ Step 2: Post Processing
 
