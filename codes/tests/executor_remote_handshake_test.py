@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 try:
     from ui_tars.executor.server import build_context, create_handler
+
     _IMPORT_ERROR = None
 except Exception as exc:  # pragma: no cover
     build_context = None
@@ -31,6 +32,7 @@ REQUEST_SCHEMA = {
         "meta": {
             "type": "object",
             "additionalProperties": True,
+            "required": ["deviceId"],
             "properties": {
                 "meshcentral_node_id": {"type": "string"},
                 "deviceId": {"type": "string"},
@@ -93,6 +95,11 @@ class ExecutorRemoteHandshakeTest(unittest.TestCase):
         cls.tmpdir.cleanup()
         os.environ.pop("AILLIUM_SCHEMAS_OVERRIDE_DIR", None)
 
+    def setUp(self):
+        os.environ.pop("AILLIUM_CORE_BASE_URL", None)
+        os.environ.pop("AILLIUM_CORE_TOKEN", None)
+        os.environ.pop("AILLIUM_CORE_TIMEOUT_SECONDS", None)
+
     def _post(self, payload, headers=None):
         conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
         conn.request(
@@ -127,6 +134,58 @@ class ExecutorRemoteHandshakeTest(unittest.TestCase):
             self.assertEqual(body["status"], "succeeded")
             client.close_session.assert_called_once_with("node-1")
 
+    def test_success_uses_core_resolved_node_id(self):
+        os.environ["AILLIUM_CORE_BASE_URL"] = "http://aillium-core.local"
+        os.environ["AILLIUM_CORE_TOKEN"] = "token"
+
+        with (
+            patch("ui_tars.executor.remote_handshake.MeshCentralClient") as mesh_client_cls,
+            patch("ui_tars.executor.remote_handshake.AilliumCoreClient") as core_client_cls,
+        ):
+            mesh_client = mesh_client_cls.return_value
+            mesh_client.open_session.return_value = {"ok": True}
+            mesh_client.fetch_session_metadata.return_value = {"hostname": "dev1"}
+            mesh_client.capture_screenshot.return_value = {"artifact": "fake"}
+            mesh_client.close_session.return_value = {"closed": True}
+            core_client_cls.return_value.resolve_meshcentral_node_id.return_value = "resolved-node-9"
+
+            status, body = self._post(
+                {
+                    "tenantId": "t-1",
+                    "requestId": "r-core",
+                    "meta": {"meshcentral_node_id": "ignored-node", "deviceId": "device-1"},
+                }
+            )
+
+            self.assertEqual(status, 200)
+            self.assertEqual(body["status"], "succeeded")
+            core_client_cls.return_value.resolve_meshcentral_node_id.assert_called_once_with(
+                tenant_id="t-1",
+                device_id="device-1",
+            )
+            mesh_client.open_session.assert_called_once_with("resolved-node-9")
+            mesh_client.close_session.assert_called_once_with("resolved-node-9")
+
+    def test_core_404_yields_400_response(self):
+        os.environ["AILLIUM_CORE_BASE_URL"] = "http://aillium-core.local"
+        os.environ["AILLIUM_CORE_TOKEN"] = "token"
+
+        with patch("ui_tars.executor.remote_handshake.AilliumCoreClient") as core_client_cls:
+            from ui_tars.executor.aillium_core_client import AilliumCoreDeviceNotFoundError
+
+            core_client_cls.return_value.resolve_meshcentral_node_id.side_effect = AilliumCoreDeviceNotFoundError("missing")
+
+            status, body = self._post(
+                {
+                    "tenantId": "t-1",
+                    "requestId": "r-404",
+                    "meta": {"deviceId": "device-missing"},
+                }
+            )
+
+            self.assertEqual(status, 400)
+            self.assertEqual(body["reasonCode"], "DEVICE_NOT_FOUND")
+
     def test_failure_still_calls_close_session(self):
         with patch("ui_tars.executor.remote_handshake.MeshCentralClient") as client_cls:
             client = client_cls.return_value
@@ -138,19 +197,13 @@ class ExecutorRemoteHandshakeTest(unittest.TestCase):
                 {
                     "tenantId": "t-1",
                     "requestId": "r-2",
-                    "meta": {"meshcentral_node_id": "node-2"},
+                    "meta": {"meshcentral_node_id": "node-2", "deviceId": "device-2"},
                 }
             )
 
             self.assertEqual(status, 200)
             self.assertEqual(body["status"], "failed")
             client.close_session.assert_called_once_with("node-2")
-
-    def test_missing_mesh_node_id_returns_400(self):
-        with patch("ui_tars.executor.remote_handshake.MeshCentralClient"):
-            status, body = self._post({"tenantId": "t-1", "requestId": "r-3", "meta": {}})
-        self.assertEqual(status, 400)
-        self.assertEqual(body["error"], "request_schema_validation_failed")
 
 
 if __name__ == "__main__":

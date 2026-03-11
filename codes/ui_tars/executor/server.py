@@ -12,7 +12,11 @@ from jsonschema.exceptions import ValidationError
 
 from .audit import Correlation, emit, setup_logging
 from .dry_run import build_dry_run_response
-from .remote_handshake import RemoteHandshakeValidationError, execute_remote_handshake
+from .remote_handshake import (
+    RemoteHandshakeExecutionError,
+    RemoteHandshakeValidationError,
+    execute_remote_handshake,
+)
 from .schema_loader import SchemaLoadError, load_schemas
 
 
@@ -99,6 +103,26 @@ def create_handler(context: AppContext):
                             "message": exc.args[0] if exc.args else str(exc),
                             "schemaPath": schema_path,
                             "instancePath": instance_path,
+                        }
+                    ).encode("utf-8")
+                )
+            except RemoteHandshakeExecutionError as exc:
+                emit(
+                    "executor.request.remote_handshake_failed",
+                    correlation,
+                    error=exc.error,
+                    message=str(exc),
+                    reasonCode=exc.reason_code,
+                    retryable=exc.retryable,
+                )
+                _json_headers(self, exc.status_code)
+                self.wfile.write(
+                    json.dumps(
+                        {
+                            "error": exc.error,
+                            "message": str(exc),
+                            "reasonCode": exc.reason_code,
+                            "retryable": exc.retryable,
                         }
                     ).encode("utf-8")
                 )
