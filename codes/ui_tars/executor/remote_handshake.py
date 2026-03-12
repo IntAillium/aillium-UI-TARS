@@ -7,13 +7,6 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
-from .aillium_core_client import (
-    AilliumCoreClient,
-    AilliumCoreClientError,
-    AilliumCoreDeviceNotFoundError,
-    AilliumCoreForbiddenError,
-    AilliumCoreRetryableError,
-)
 from .meshcentral_client import MeshCentralClient
 
 
@@ -55,9 +48,7 @@ def execute_remote_handshake(
     tenant_id = request_payload.get("tenantId")
     request_id = request_payload.get("requestId")
     meta = request_payload.get("meta") if isinstance(request_payload.get("meta"), dict) else {}
-    core_enabled = bool(os.getenv("AILLIUM_CORE_BASE_URL", "").strip())
     mesh_node_id = meta.get("meshcentral_node_id")
-    device_id = request_payload.get("deviceId") or meta.get("deviceId") or meta.get("device_id")
     trace_id = _extract_trace_id(request_payload, headers)
 
     if not tenant_id:
@@ -66,6 +57,8 @@ def execute_remote_handshake(
         raise RemoteHandshakeValidationError("requestId is required")
     if not device_id:
         raise RemoteHandshakeValidationError("deviceId is required in executor.request")
+    if not mesh_node_id:
+        raise RemoteHandshakeValidationError("meta.meshcentral_node_id is required")
 
     if core_enabled:
         core_client = AilliumCoreClient()
@@ -76,40 +69,7 @@ def execute_remote_handshake(
                 status_code=403,
                 error="forbidden",
                 message="aillium-core denied access to device resolution",
-                reason_code="AILLIUM_CORE_FORBIDDEN",
-            ) from exc
-        except AilliumCoreDeviceNotFoundError as exc:
-            raise RemoteHandshakeExecutionError(
-                status_code=400,
-                error="device_not_found",
-                message="deviceId was not found in aillium-core",
-                reason_code="DEVICE_NOT_FOUND",
-            ) from exc
-        except AilliumCoreRetryableError as exc:
-            raise RemoteHandshakeExecutionError(
-                status_code=500,
-                error="core_resolution_failed",
-                message=str(exc),
-                reason_code="AILLIUM_CORE_RETRYABLE",
-                retryable=True,
-            ) from exc
-        except AilliumCoreClientError as exc:
-            raise RemoteHandshakeExecutionError(
-                status_code=500,
-                error="core_resolution_failed",
-                message=str(exc),
-                reason_code="AILLIUM_CORE_RESOLUTION_FAILED",
-            ) from exc
-    elif not mesh_node_id:
-        raise RemoteHandshakeValidationError(
-            "meta.meshcentral_node_id is required when AILLIUM_CORE_BASE_URL is unset"
-        )
-
-    handshake_client = client or MeshCentralClient()
-
-    started_at = _now()
-    status = "succeeded"
-    message = "Remote handshake completed"
+                
     metadata_payload: dict[str, Any] = {}
     screenshot_payload: dict[str, Any] | None = None
     logs: list[dict[str, Any]] = [
