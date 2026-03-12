@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from datetime import datetime, timezone
 from typing import Any
 
 from jsonschema import Draft202012Validator
 
 from .meshcentral_client import MeshCentralClient
+from .meshcentral_mock import MockMeshCentralClient
 
 
 class RemoteHandshakeValidationError(ValueError):
@@ -56,6 +58,23 @@ def _artifact_key(prefix: str, tenant_id: str, request_id: str, kind: str) -> st
     return f"{prefix}/{tenant_id}/{request_id}/{kind}/{digest}.json"
 
 
+def _select_meshcentral_client(explicit: MeshCentralClient | None) -> MeshCentralClient:
+    """
+    If a client is provided (tests), use it.
+    Otherwise:
+      - MESHCENTRAL_MOCK=1 -> MockMeshCentralClient (no MeshCentral env required)
+      - default           -> MeshCentralClient (requires MeshCentral env)
+    """
+    if explicit is not None:
+        return explicit
+
+    if os.getenv("MESHCENTRAL_MOCK", "").strip() == "1":
+        return MockMeshCentralClient()
+
+    # REAL client path (kept active; will require MESHCENTRAL_URL + key/token)
+    return MeshCentralClient()
+
+
 def execute_remote_handshake(
     request_payload: dict[str, Any],
     request_validator: Draft202012Validator,
@@ -87,7 +106,8 @@ def execute_remote_handshake(
         raise RemoteHandshakeValidationError("meta.meshcentral_node_id is required (Option A)")
 
     mesh_node_id = mesh_node_id.strip()
-    handshake_client = client or MeshCentralClient()
+
+    handshake_client = _select_meshcentral_client(client)
 
     started_at = _now()
     status = "succeeded"
@@ -160,7 +180,7 @@ def execute_remote_handshake(
             )
 
     except Exception as exc:
-        # Option A semantics: return 200 with a response payload whose status="failed"
+        # Option A semantics: return 200 with status="failed"
         status = "failed"
         message = "Remote handshake failed"
         logs.append(
@@ -176,9 +196,6 @@ def execute_remote_handshake(
                 "mesh_node_id": mesh_node_id,
             }
         )
-
-        # Still attempt close_session in finally (below), then return a failed response.
-        # (Do NOT raise here; the tests expect HTTP 200 and body.status="failed".)
 
     finally:
         try:
