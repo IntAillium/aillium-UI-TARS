@@ -52,7 +52,7 @@ def _corr_from_payload_and_headers(payload: dict[str, Any], headers) -> Correlat
 
 def create_handler(context: AppContext):
     class ExecutorHandler(BaseHTTPRequestHandler):
-        def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler signature
+        def do_POST(self):  # noqa: N802
             if self.path not in {"/executor/dry-run", "/executor/remote-handshake"}:
                 _json_headers(self, HTTPStatus.NOT_FOUND)
                 self.wfile.write(json.dumps({"error": "not_found"}).encode("utf-8"))
@@ -66,6 +66,7 @@ def create_handler(context: AppContext):
                 correlation = _corr_from_payload_and_headers(payload, self.headers)
                 emit("executor.request.received", correlation, path=self.path)
 
+                # Validate request schema first
                 context.request_validator.validate(payload)
                 emit("executor.request.validated", correlation, validation="passed")
 
@@ -82,12 +83,15 @@ def create_handler(context: AppContext):
                         response_schema=context.response_schema,
                         headers={k.lower(): v for k, v in self.headers.items()},
                     )
+
                 emit("executor.response.validated", correlation, validation="passed")
                 _json_headers(self, HTTPStatus.OK)
                 self.wfile.write(json.dumps(response_payload).encode("utf-8"))
+
             except (ValidationError, RemoteHandshakeValidationError) as exc:
                 schema_path = list(exc.schema_path) if isinstance(exc, ValidationError) else []
                 instance_path = list(exc.path) if isinstance(exc, ValidationError) else []
+
                 emit(
                     "executor.request.validation_failed",
                     correlation,
@@ -106,7 +110,9 @@ def create_handler(context: AppContext):
                         }
                     ).encode("utf-8")
                 )
+
             except RemoteHandshakeExecutionError as exc:
+                # Remote-handshake execution errors are deliberately shaped
                 emit(
                     "executor.request.remote_handshake_failed",
                     correlation,
@@ -126,13 +132,17 @@ def create_handler(context: AppContext):
                         }
                     ).encode("utf-8")
                 )
+
             except Exception as exc:
-                emit("executor.request.failed", correlation, error=str(exc), errorType=type(exc).__name__)
+                emit(
+                    "executor.request.failed",
+                    correlation,
+                    error=str(exc),
+                    errorType=type(exc).__name__,
+                )
                 _json_headers(self, HTTPStatus.INTERNAL_SERVER_ERROR)
                 self.wfile.write(
-                    json.dumps({"error": "internal_executor_error", "message": str(exc)}).encode(
-                        "utf-8"
-                    )
+                    json.dumps({"error": "internal_executor_error", "message": str(exc)}).encode("utf-8")
                 )
 
         def do_GET(self):  # noqa: N802
@@ -167,7 +177,7 @@ def run() -> None:
     host = os.getenv("EXECUTOR_HOST", "0.0.0.0")
     port = int(os.getenv("EXECUTOR_PORT", "8080"))
     server = ThreadingHTTPServer((host, port), create_handler(context))
-    print(f"Executor dry-run server listening on http://{host}:{port}")
+    print(f"Executor server listening on http://{host}:{port}")
     server.serve_forever()
 
 
