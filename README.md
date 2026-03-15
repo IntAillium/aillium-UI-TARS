@@ -69,6 +69,22 @@ See `LICENSE` and `NOTICE` for attribution and licensing details.
 We also offer a **UI-TARS-desktop** version, which can operate on your **local personal device**. To use it, please visit [https://github.com/bytedance/UI-TARS-desktop](https://github.com/bytedance/UI-TARS-desktop). To use UI-TARS in web automation, you may refer to the open-source project [Midscene.js](https://github.com/web-infra-dev/Midscene).
 **❗Notes**: Since Qwen 2.5vl based models ultilizes absolute coordinates to ground objects, please kindly refer to our illustration about how to process coordinates in this <a href="README_coordinates.md">guide</a>.
 
+## Pivoted Repository Role (OpenClaw Runtime Transition)
+
+`aillium-tars` is now intentionally narrowed to **transition-safe executor utilities**, not long-term runtime orchestration.
+
+Primary surviving scope:
+- contract-aware dry-run execution simulation (`/executor/dry-run`)
+- request/response schema validation against `aillium-schemas`
+- deterministic audit/evidence shaping for migration and test environments
+- short-term MeshCentral remote handshake bootstrap (`/executor/remote-handshake`) while runtime responsibilities shift to OpenClaw
+
+Explicitly out of scope / deprecated direction:
+- runtime orchestration and planning (OpenClaw owns this)
+- control-plane state resolution (Aillium Core owns this)
+- legacy push/inbound worker paths
+- duplicated browser/runtime execution pathways that imply TARS is the strategic runtime center
+
 ## Updates
 - 🌟 2025.09.04: We’re excited to announce the release the **UI-TARS-2**, which is a major upgrade from UI-TARS-1.5, featuring with enhanced capabilities in GUI, Game, Code and Tool Use. It is an "All In One" Agent model, enabling seamless integration of multiple abilities for complex tasks. Please check our new [technical report](https://arxiv.org/abs/2509.02544) for more details. Refer to more fantastic showcases at our [website](https://seed-tars.com/showcase/ui-tars-2/).
 - 🌟 2025.04.16: We shared the latest progress of the UI-TARS-1.5 model in our [blog](https://seed-tars.com/1.5), which excels in playing games and performing GUI tasks, and we open-sourced the [UI-TARS-1.5-7B](https://huggingface.co/ByteDance-Seed/UI-TARS-1.5-7B).

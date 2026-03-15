@@ -20,6 +20,12 @@ from .remote_handshake import (
 from .schema_loader import SchemaLoadError, load_schemas
 
 
+DEPRECATED_ENDPOINTS = {
+    "/executor/push": "Legacy push worker path is deprecated; route execution via OpenClaw and use /executor/dry-run only for migration validation.",
+    "/executor/inbound": "Legacy inbound worker path is deprecated; route execution via OpenClaw and use /executor/remote-handshake only when transition support is required.",
+}
+
+
 @dataclass(frozen=True)
 class AppContext:
     request_validator: Draft202012Validator
@@ -53,6 +59,18 @@ def _corr_from_payload_and_headers(payload: dict[str, Any], headers) -> Correlat
 def create_handler(context: AppContext):
     class ExecutorHandler(BaseHTTPRequestHandler):
         def do_POST(self):  # noqa: N802
+            if self.path in DEPRECATED_ENDPOINTS:
+                _json_headers(self, HTTPStatus.GONE)
+                self.wfile.write(
+                    json.dumps(
+                        {
+                            "error": "endpoint_deprecated",
+                            "message": DEPRECATED_ENDPOINTS[self.path],
+                        }
+                    ).encode("utf-8")
+                )
+                return
+
             if self.path not in {"/executor/dry-run", "/executor/remote-handshake"}:
                 _json_headers(self, HTTPStatus.NOT_FOUND)
                 self.wfile.write(json.dumps({"error": "not_found"}).encode("utf-8"))
