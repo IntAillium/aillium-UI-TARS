@@ -168,6 +168,7 @@ def build_context() -> AppContext:
 
 
 def run() -> None:
+    """Deprecated inbound executor server (push model); retained for compatibility only."""
     setup_logging()
     try:
         context = build_context()
@@ -177,7 +178,7 @@ def run() -> None:
     host = os.getenv("EXECUTOR_HOST", "0.0.0.0")
     port = int(os.getenv("EXECUTOR_PORT", "8080"))
     server = ThreadingHTTPServer((host, port), create_handler(context))
-    print(f"Executor server listening on http://{host}:{port}")
+    print(f"[DEPRECATED] Executor server listening on http://{host}:{port}; prefer poll worker mode")
     server.serve_forever()
 
 
