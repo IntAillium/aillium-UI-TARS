@@ -192,3 +192,36 @@ curl -sS -X POST http://localhost:8080/executor/dry-run \
     "meta": {"simulate_failure": false}
   }'
 ```
+
+
+## Aillium Worker Poll Loop (Milestone A)
+
+Primary runtime is now the polling worker (not inbound push server).
+
+### Start worker against real aillium-core
+
+```bash
+cd codes
+PYTHONPATH=. MESHCENTRAL_MOCK=1 python -m ui_tars.executor.worker
+```
+
+Required env vars:
+- `AILLIUM_CORE_BASE_URL`
+- `AILLIUM_CORE_TOKEN`
+
+Optional env vars:
+- `AILLIUM_CORE_TIMEOUT_SECONDS` (default `10`)
+- `AILLIUM_POLL_INTERVAL_SECONDS` (default `0.2`)
+- `AILLIUM_IDLE_BACKOFF_SECONDS` (default `1.0`)
+- `AILLIUM_WORKER_ID` (or auto-generated and persisted)
+- `AILLIUM_WORKER_ID_FILE` (default `~/.aillium-worker-id`)
+- `AILLIUM_TASK_TYPE` (default `remote-handshake`)
+
+### End-to-end local MVP harness
+
+See `docs/milestone_a_local_mvp.md` and run:
+
+```bash
+cd codes
+PYTHONPATH=. MESHCENTRAL_MOCK=1 python scripts/local_milestone_a_mvp.py
+```

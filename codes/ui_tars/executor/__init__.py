@@ -1,5 +1,5 @@
-"""Dry-run executor package for Aillium UI-TARS."""
+"""Executor package for Aillium UI-TARS."""
 
-from .server import run
+from .worker import run
 
 __all__ = ["run"]

@@ -58,22 +58,42 @@ class AilliumCoreClient:
             timeout_seconds=timeout_seconds,
         )
 
-    def _request(self, method: str, path: str) -> Any:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        query: dict[str, str] | None = None,
+    ) -> Any:
+        body = None
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self._config.token}",
+        }
+
+        url = f"{self._config.base_url}{path}"
+        if query:
+            url = f"{url}?{parse.urlencode(query)}"
+
+        if payload is not None:
+            body = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+
         req = request.Request(
-            url=f"{self._config.base_url}{path}",
+            url=url,
             method=method.upper(),
-            headers={
-                "Accept": "application/json",
-                "Authorization": f"Bearer {self._config.token}",
-            },
+            headers=headers,
+            data=body,
         )
 
         try:
             with request.urlopen(req, timeout=self._config.timeout_seconds) as resp:
-                payload = resp.read()
-                if not payload:
+                if resp.status == 204:
+                    return None
+                response_payload = resp.read()
+                if not response_payload:
                     return {}
-                return json.loads(payload.decode("utf-8"))
+                return json.loads(response_payload.decode("utf-8"))
         except error.HTTPError as exc:
             if exc.code in {401, 403}:
                 raise AilliumCoreForbiddenError(
@@ -100,16 +120,13 @@ class AilliumCoreClient:
         tenant = parse.quote(tenant_id, safe="")
         device = parse.quote(device_id, safe="")
 
-        # aillium-core v1 Device Registry endpoint
         payload = self._request("GET", f"/tenants/{tenant}/devices/{device}")
 
         if not isinstance(payload, dict):
             raise AilliumCoreClientError("aillium-core response must be a JSON object")
 
-        # Core currently returns Prisma model fields (camelCase)
         mesh_node_id = payload.get("meshcentralNodeId")
 
-        # Backward/forward compatibility: if Core later wraps responses or uses snake_case
         if not mesh_node_id and isinstance(payload.get("data"), dict):
             data = payload["data"]
             mesh_node_id = data.get("meshcentralNodeId") or data.get("meshcentral_node_id")
@@ -123,3 +140,28 @@ class AilliumCoreClient:
             )
 
         return mesh_node_id.strip()
+
+    def poll_executor_task(self, task_type: str) -> dict[str, Any] | None:
+        response = self._request(
+            "GET",
+            "/api/v1/workers/tasks/poll",
+            query={"task_type": task_type},
+        )
+        if response is None:
+            return None
+        if not isinstance(response, dict):
+            raise AilliumCoreClientError("poll response must be a JSON object")
+        return response
+
+    def submit_executor_result(self, task_id: str, result_payload: dict[str, Any]) -> dict[str, Any]:
+        task = parse.quote(task_id, safe="")
+        response = self._request(
+            "POST",
+            f"/api/v1/workers/tasks/{task}/result",
+            payload=result_payload,
+        )
+        if response is None:
+            return {}
+        if not isinstance(response, dict):
+            raise AilliumCoreClientError("result callback response must be a JSON object")
+        return response
