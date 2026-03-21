@@ -149,9 +149,17 @@ Apache-2.0 License
 
 ## Aillium Executor Dry-Run (A-5a MVP)
 
-This repository now includes an HTTP dry-run executor endpoint for contract validation and deterministic mock execution.
+This repository now keeps a **reduced transition role**: HTTP dry-run + remote-handshake support for contract validation and deterministic mock execution while OpenClaw owns runtime orchestration.
 
 ### Behavior
+
+
+### Transition scope and deprecations
+
+- Keep: schema-driven validation, deterministic dry-run responses, audit/evidence payload shaping.
+- Keep (temporary): remote-handshake bootstrap path for MeshCentral-assisted transition scenarios.
+- Deprecated: legacy push/inbound worker paths (`/executor/push`, `/executor/inbound`).
+- Deprecated directionally: any duplicated browser/runtime orchestration logic now superseded by OpenClaw.
 
 - Endpoint: `POST /executor/dry-run`
 - Validates input against `executor.request` from `aillium-schemas`

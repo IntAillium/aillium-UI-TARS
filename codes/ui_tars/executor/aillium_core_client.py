@@ -1,3 +1,9 @@
+"""DEPRECATED: Legacy aillium-core lookup client kept only for migration reference.
+
+OpenClaw/Aillium Core now own runtime/control-plane resolution flows, so this module
+should not be used as a strategic execution path in TARS.
+"""
+
 from __future__ import annotations
 
 import json

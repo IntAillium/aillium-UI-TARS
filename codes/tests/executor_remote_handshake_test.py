@@ -143,5 +143,26 @@ class ExecutorRemoteHandshakeTest(unittest.TestCase):
             server.shutdown()
 
 
+
+    def test_legacy_push_and_inbound_paths_are_deprecated(self):
+        server, port = self._start_server()
+        try:
+            payload = {"tenantId": "t1", "requestId": "r1", "deviceId": "d1", "meta": {"meshcentral_node_id": "node-1"}}
+            for path in ("/executor/push", "/executor/inbound"):
+                data = json.dumps(payload).encode("utf-8")
+                req = urllib.request.Request(
+                    url=f"http://127.0.0.1:{port}{path}",
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                    data=data,
+                )
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(req, timeout=3)
+                self.assertEqual(ctx.exception.code, 410)
+                body = json.loads(ctx.exception.read().decode("utf-8"))
+                self.assertEqual(body["error"], "endpoint_deprecated")
+        finally:
+            server.shutdown()
+
 if __name__ == "__main__":
     unittest.main()
