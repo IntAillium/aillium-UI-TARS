@@ -271,5 +271,10 @@ def execute_remote_handshake(
         },
     }
 
+    # NOTE: response_schema (executor.response.schema.json) is not validated here.
+    # The handshake response uses an ad-hoc shape (tenantId, requestId, timing, etc.)
+    # that does not conform to the canonical executor.response contract (which requires
+    # contract_type, response_id, completed_at, etc. with additionalProperties:false).
+    # Aligning the response shape is deferred to post-MVP. See contract-boundaries.md.
     _ = response_schema
     return response_payload

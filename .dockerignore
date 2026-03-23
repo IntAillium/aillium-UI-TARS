@@ -1,0 +1,6 @@
+.git
+data
+figures
+*.pdf
+*.md
+codes/tests

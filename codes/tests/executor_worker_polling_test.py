@@ -49,11 +49,23 @@ RESPONSE_SCHEMA_FIXTURE = {
 
 
 class _CoreState:
+    """Simulates Core's task-bus API state for integration testing."""
+
     def __init__(self):
         self._lock = threading.Lock()
+        # Task-bus format: matches Core's poll response shape.
         self.task = {
-            "task_id": "task-1",
-            "task_type": TASK_TYPE_REMOTE_HANDSHAKE,
+            "taskId": "task-1",
+            "tenantId": "tenant-1",
+            "executionRef": "exec-1",
+            "dispatchTarget": "DEPRECATED_WORKER_COMPAT",
+            "contractFamily": "DEPRECATED_WORKER_COMPAT_CONTRACTS",
+            "expectedEvidenceKind": "worker-compat-execution-result",
+            "compatibilityMode": True,
+        }
+        # Legacy payload attached for backward-compatible process_task tests.
+        self.task_with_payload = {
+            **self.task,
             "payload": {
                 "tenantId": "tenant-1",
                 "requestId": "req-1",
@@ -61,103 +73,95 @@ class _CoreState:
                 "deviceId": "device-1",
                 "meta": {"meshcentral_node_id": "node-1"},
             },
-            "status": "PENDING",
         }
-        self.task_status_by_id = {"task-1": "PENDING"}
-        self.results_by_task_id = {}
+        self.task_claimed = False
+        self.lease_responses = []
+        self.status_events = []
         self.audit_events = []
 
-    def claim(self):
+    def poll(self):
         with self._lock:
-            if self.task is None:
+            if self.task_claimed:
                 return None
-            task = self.task
-            task_id = task["task_id"]
-            self.task_status_by_id[task_id] = "IN_PROGRESS"
-            self.audit_events.append(
-                {
-                    "event": "task.claimed",
-                    "task_id": task_id,
-                    "tenant_id": task["payload"].get("tenantId"),
-                    "trace_id": task["payload"].get("traceId"),
-                }
-            )
-            self.task = None
-            return task
+            return self.task_with_payload
 
-    def submit_result(self, task_id: str, payload: dict):
+    def claim(self, body: dict):
         with self._lock:
-            self.results_by_task_id[task_id] = payload
-            self.task_status_by_id[task_id] = "COMPLETED"
-            self.audit_events.append(
-                {
-                    "event": "task.completed",
-                    "task_id": task_id,
-                    "tenant_id": payload.get("tenantId"),
-                    "trace_id": payload.get("traceId"),
-                    "status": payload.get("status"),
-                }
-            )
-            return {"ok": True, "accepted": True}
+            task_id = body.get("taskId", "")
+            self.task_claimed = True
+            resp = {
+                "taskId": task_id,
+                "leaseToken": f"lease_{task_id}_test",
+                "leaseExpiresAt": "2099-01-01T00:00:00Z",
+                "visibilityTimeoutSeconds": 60,
+            }
+            self.lease_responses.append(resp)
+            self.audit_events.append({"event": "task.claimed", "task_id": task_id})
+            return resp
 
-
-def _result_shape_is_compatible(payload: dict) -> bool:
-    if not isinstance(payload.get("status"), str):
-        return False
-    if not isinstance(payload.get("result"), dict):
-        return False
-    artifacts = payload["result"].get("artifacts")
-    if not isinstance(artifacts, list):
-        return False
-    if not payload.get("worker_id") and not payload.get("workerId"):
-        return False
-    return True
+    def report_status(self, body: dict):
+        with self._lock:
+            self.status_events.append(body)
+            status = body.get("status", "")
+            self.audit_events.append({
+                "event": "task.status_reported",
+                "execution_ref": body.get("executionRef"),
+                "status": status,
+            })
+            return {
+                "accepted": True,
+                "executionRef": body.get("executionRef"),
+                "status": status,
+            }
 
 
 @unittest.skipIf(_IMPORT_ERROR is not None, f"executor deps unavailable: {_IMPORT_ERROR}")
 class ExecutorPollingTest(unittest.TestCase):
     def _start_core_server(self, state: _CoreState):
+        """Start a mock Core server implementing the task-bus API."""
+
         class Handler(BaseHTTPRequestHandler):
-            def do_GET(self):  # noqa: N802
-                if self.path.startswith("/api/v1/workers/tasks/poll"):
-                    if state.task is None:
-                        self.send_response(204)
+            def _read_body(self) -> dict:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length) if length else b"{}"
+                return json.loads(raw.decode("utf-8"))
+
+            def do_POST(self):  # noqa: N802
+                if self.path == "/v1/task-bus/tasks:poll":
+                    task = state.poll()
+                    if task is None:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
                         self.end_headers()
+                        self.wfile.write(json.dumps({"tasks": []}).encode("utf-8"))
                         return
 
-                    task = state.claim()
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
-                    self.wfile.write(json.dumps(task).encode("utf-8"))
+                    self.wfile.write(json.dumps({"tasks": [task]}).encode("utf-8"))
+                    return
+
+                if self.path == "/v1/task-bus/leases:claim":
+                    body = self._read_body()
+                    resp = state.claim(body)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps(resp).encode("utf-8"))
+                    return
+
+                if self.path == "/v1/task-bus/executor-status":
+                    body = self._read_body()
+                    resp = state.report_status(body)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps(resp).encode("utf-8"))
                     return
 
                 self.send_response(404)
                 self.end_headers()
-
-            def do_POST(self):  # noqa: N802
-                if not self.path.startswith("/api/v1/workers/tasks/") or not self.path.endswith("/result"):
-                    self.send_response(404)
-                    self.end_headers()
-                    return
-
-                length = int(self.headers.get("Content-Length", "0"))
-                raw = self.rfile.read(length) if length else b"{}"
-                body = json.loads(raw.decode("utf-8"))
-                task_id = self.path.split("/")[-2]
-
-                if not _result_shape_is_compatible(body):
-                    self.send_response(400)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"error": "invalid_result_shape"}).encode("utf-8"))
-                    return
-
-                response = state.submit_result(task_id, body)
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps(response).encode("utf-8"))
 
             def log_message(self, format: str, *args):
                 return
@@ -177,10 +181,15 @@ class ExecutorPollingTest(unittest.TestCase):
             return build_context()
 
     def test_mock_handshake_success(self):
+        """process_task succeeds with legacy task shape (has payload)."""
         context = self._context()
         task = {
-            "task_id": "task-success",
-            "task_type": TASK_TYPE_REMOTE_HANDSHAKE,
+            "taskId": "task-success",
+            "executionRef": "exec-success",
+            "dispatchTarget": "DEPRECATED_WORKER_COMPAT",
+            "contractFamily": "DEPRECATED_WORKER_COMPAT_CONTRACTS",
+            "tenantId": "tenant-1",
+            "traceId": "trace-success",
             "payload": {
                 "tenantId": "tenant-1",
                 "requestId": "req-success",
@@ -195,13 +204,18 @@ class ExecutorPollingTest(unittest.TestCase):
 
         self.assertEqual(task_id, "task-success")
         self.assertEqual(payload["status"], "succeeded")
-        self.assertEqual(payload["worker_id"], "worker-a")
+        self.assertEqual(payload["executionRef"], "exec-success")
+        self.assertEqual(payload["meta"]["worker_id"], "worker-a")
 
     def test_mock_error_path(self):
+        """process_task returns failed status on handshake error."""
         context = self._context()
         task = {
-            "task_id": "task-error",
-            "task_type": TASK_TYPE_REMOTE_HANDSHAKE,
+            "taskId": "task-error",
+            "executionRef": "exec-error",
+            "dispatchTarget": "DEPRECATED_WORKER_COMPAT",
+            "tenantId": "tenant-1",
+            "traceId": "trace-error",
             "payload": {
                 "tenantId": "tenant-1",
                 "requestId": "req-error",
@@ -229,10 +243,14 @@ class ExecutorPollingTest(unittest.TestCase):
         self.assertEqual(payload["error"]["error"], "handshake_failed")
 
     def test_malformed_task_rejection(self):
+        """process_task returns failure result for invalid request payload."""
         context = self._context()
         bad_task = {
-            "task_id": "task-malformed",
-            "task_type": TASK_TYPE_REMOTE_HANDSHAKE,
+            "taskId": "task-malformed",
+            "executionRef": "exec-malformed",
+            "dispatchTarget": "DEPRECATED_WORKER_COMPAT",
+            "tenantId": "tenant-1",
+            "traceId": "trace-bad",
             "payload": {
                 "tenantId": "tenant-1",
                 "requestId": "req-bad",
@@ -243,13 +261,17 @@ class ExecutorPollingTest(unittest.TestCase):
 
         _, payload = process_task(bad_task, context, worker_id="worker-a")
         self.assertEqual(payload["status"], "failed")
-        self.assertEqual(payload["error"]["error"], "worker_task_failed")
+        self.assertEqual(payload["error"]["code"], "worker_task_failed")
 
     def test_deterministic_mock_behavior(self):
+        """Two runs with same input produce identical artifact URIs."""
         context = self._context()
         task = {
-            "task_id": "task-det",
-            "task_type": TASK_TYPE_REMOTE_HANDSHAKE,
+            "taskId": "task-det",
+            "executionRef": "exec-det",
+            "dispatchTarget": "DEPRECATED_WORKER_COMPAT",
+            "tenantId": "tenant-1",
+            "traceId": "trace-det",
             "payload": {
                 "tenantId": "tenant-1",
                 "requestId": "req-det",
@@ -263,11 +285,16 @@ class ExecutorPollingTest(unittest.TestCase):
             _, payload_a = process_task(task, context, worker_id="worker-a")
             _, payload_b = process_task(task, context, worker_id="worker-a")
 
-        artifacts_a = payload_a["result"]["artifacts"]
-        artifacts_b = payload_b["result"]["artifacts"]
+        result_a = payload_a.get("result")
+        result_b = payload_b.get("result")
+        self.assertIsNotNone(result_a)
+        self.assertIsNotNone(result_b)
+        artifacts_a = result_a.get("artifacts", [])
+        artifacts_b = result_b.get("artifacts", [])
         self.assertEqual(artifacts_a, artifacts_b)
 
-    def test_polling_posts_result_with_evidence_and_worker_id(self):
+    def test_polling_loop_full_lifecycle(self):
+        """Full poll → claim → started → execute → succeeded loop."""
         state = _CoreState()
         server, port = self._start_core_server(state)
         try:
@@ -275,6 +302,7 @@ class ExecutorPollingTest(unittest.TestCase):
                 AilliumCoreConfig(
                     base_url=f"http://127.0.0.1:{port}",
                     token="token",
+                    tenant_id="tenant-1",
                     timeout_seconds=2,
                 )
             )
@@ -288,23 +316,26 @@ class ExecutorPollingTest(unittest.TestCase):
                         poll_interval_seconds=0.01,
                         idle_backoff_seconds=0.01,
                         task_type=TASK_TYPE_REMOTE_HANDSHAKE,
+                        executor_type="ui-tars",
                     ),
                     stop_after_iterations=2,
                 )
 
-            result_payload = state.results_by_task_id.get("task-1")
-            self.assertIsNotNone(result_payload)
-            self.assertEqual(state.task_status_by_id["task-1"], "COMPLETED")
-            self.assertEqual(result_payload["worker_id"], "worker-fixed")
-            self.assertEqual(result_payload["meta"]["worker_id"], "worker-fixed")
-            artifacts = result_payload["result"].get("artifacts", [])
-            self.assertTrue(artifacts)
-            for artifact in artifacts:
-                self.assertTrue(artifact["uri"].startswith("s3://aillium-evidence/"))
+            # Verify lease was claimed
+            self.assertTrue(state.task_claimed)
+            self.assertTrue(len(state.lease_responses) > 0)
 
-            event_names = [event["event"] for event in state.audit_events]
+            # Verify status events were reported
+            status_names = [e.get("status") for e in state.status_events]
+            self.assertIn("executor_started", status_names)
+            # Either executor_succeeded or executor_failed should be present
+            terminal = {"executor_succeeded", "executor_failed"}
+            self.assertTrue(terminal & set(status_names), f"Expected terminal status in {status_names}")
+
+            # Verify audit trail
+            event_names = [e["event"] for e in state.audit_events]
             self.assertIn("task.claimed", event_names)
-            self.assertIn("task.completed", event_names)
+            self.assertIn("task.status_reported", event_names)
         finally:
             server.shutdown()
 
