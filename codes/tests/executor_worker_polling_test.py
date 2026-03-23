@@ -56,6 +56,7 @@ class _CoreState:
         # Task-bus format: matches Core's poll response shape.
         self.task = {
             "taskId": "task-1",
+            "tenantId": "tenant-1",
             "executionRef": "exec-1",
             "dispatchTarget": "DEPRECATED_WORKER_COMPAT",
             "contractFamily": "DEPRECATED_WORKER_COMPAT_CONTRACTS",

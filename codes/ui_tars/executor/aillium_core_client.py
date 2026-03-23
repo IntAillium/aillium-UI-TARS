@@ -180,10 +180,12 @@ class AilliumCoreClient:
         tasks = response.get("tasks", [])
         if not tasks:
             return None
-        # Return the first eligible task with trace_id attached for downstream use
+        # Return the first eligible task.
+        # tenantId is now returned by core; traceId is per-poll correlation.
         task = tasks[0]
         task["traceId"] = trace_id
-        task["tenantId"] = self._config.tenant_id
+        if "tenantId" not in task:
+            task["tenantId"] = self._config.tenant_id
         return task
 
     def claim_task_lease(
