@@ -1,14 +1,17 @@
-"""DEPRECATED: Legacy aillium-core lookup client kept only for migration reference.
+"""Aillium Core task-bus client for the TARS worker.
 
-OpenClaw/Aillium Core now own runtime/control-plane resolution flows, so this module
-should not be used as a strategic execution path in TARS.
+Communicates with the aillium-core control plane via the task-bus API
+(POST /v1/task-bus/*).  Requires AILLIUM_TENANT_ID so that the worker
+can identify which tenant's tasks to poll and claim.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 from urllib import error, parse, request
 
@@ -33,6 +36,7 @@ class AilliumCoreRetryableError(AilliumCoreClientError):
 class AilliumCoreConfig:
     base_url: str
     token: str
+    tenant_id: str
     timeout_seconds: float
 
 
@@ -50,6 +54,10 @@ class AilliumCoreClient:
         if not token:
             raise AilliumCoreClientError("AILLIUM_CORE_TOKEN must be set")
 
+        tenant_id = os.getenv("AILLIUM_TENANT_ID", "").strip()
+        if not tenant_id:
+            raise AilliumCoreClientError("AILLIUM_TENANT_ID must be set")
+
         timeout_raw = os.getenv("AILLIUM_CORE_TIMEOUT_SECONDS", "10")
         try:
             timeout_seconds = float(timeout_raw)
@@ -61,6 +69,7 @@ class AilliumCoreClient:
         return AilliumCoreConfig(
             base_url=base_url,
             token=token,
+            tenant_id=tenant_id,
             timeout_seconds=timeout_seconds,
         )
 
@@ -70,12 +79,16 @@ class AilliumCoreClient:
         path: str,
         payload: dict[str, Any] | None = None,
         query: dict[str, str] | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> Any:
         body = None
-        headers = {
+        headers: dict[str, str] = {
             "Accept": "application/json",
             "Authorization": f"Bearer {self._config.token}",
+            "X-Tenant-Id": self._config.tenant_id,
         }
+        if extra_headers:
+            headers.update(extra_headers)
 
         url = f"{self._config.base_url}{path}"
         if query:
@@ -147,27 +160,126 @@ class AilliumCoreClient:
 
         return mesh_node_id.strip()
 
-    def poll_executor_task(self, task_type: str) -> dict[str, Any] | None:
+    def poll_executor_task(self, executor_type: str) -> dict[str, Any] | None:
+        """Poll the task-bus for available tasks.
+
+        Aligns with Core endpoint: POST /v1/task-bus/tasks:poll
+        Returns the first eligible task dict or None if no tasks available.
+        """
+        trace_id = str(uuid.uuid4())
         response = self._request(
-            "GET",
-            "/api/v1/workers/tasks/poll",
-            query={"task_type": task_type},
+            "POST",
+            "/v1/task-bus/tasks:poll",
+            payload={"executorType": executor_type},
+            extra_headers={"X-Trace-Id": trace_id},
         )
         if response is None:
             return None
         if not isinstance(response, dict):
             raise AilliumCoreClientError("poll response must be a JSON object")
-        return response
+        tasks = response.get("tasks", [])
+        if not tasks:
+            return None
+        # Return the first eligible task with trace_id attached for downstream use
+        task = tasks[0]
+        task["traceId"] = trace_id
+        task["tenantId"] = self._config.tenant_id
+        return task
 
-    def submit_executor_result(self, task_id: str, result_payload: dict[str, Any]) -> dict[str, Any]:
-        task = parse.quote(task_id, safe="")
+    def claim_task_lease(
+        self, task_id: str, executor_type: str, visibility_timeout_seconds: int = 60
+    ) -> dict[str, Any]:
+        """Claim a lease on a polled task.
+
+        Aligns with Core endpoint: POST /v1/task-bus/leases:claim
+        Returns lease details including leaseToken and leaseExpiresAt.
+        """
+        idempotency_key = str(uuid.uuid4())
         response = self._request(
             "POST",
-            f"/api/v1/workers/tasks/{task}/result",
-            payload=result_payload,
+            "/v1/task-bus/leases:claim",
+            payload={
+                "taskId": task_id,
+                "executorType": executor_type,
+                "visibilityTimeoutSeconds": visibility_timeout_seconds,
+            },
+            extra_headers={"Idempotency-Key": idempotency_key},
         )
         if response is None:
             return {}
         if not isinstance(response, dict):
-            raise AilliumCoreClientError("result callback response must be a JSON object")
+            raise AilliumCoreClientError("claim response must be a JSON object")
         return response
+
+    def report_executor_status(
+        self,
+        *,
+        execution_ref: str,
+        executor_type: str,
+        status: str,
+        trace_id: str,
+        artifacts: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        """Report executor status back to the task-bus.
+
+        Aligns with Core endpoint: POST /v1/task-bus/executor-status
+        Status values: executor_contract_accepted, executor_contract_rejected,
+        executor_started, executor_succeeded, executor_failed, executor_timed_out
+        """
+        idempotency_key = str(uuid.uuid4())
+        payload: dict[str, Any] = {
+            "executionRef": execution_ref,
+            "executorType": executor_type,
+            "status": status,
+            "eventTimestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        if artifacts:
+            payload["artifacts"] = artifacts
+
+        response = self._request(
+            "POST",
+            "/v1/task-bus/executor-status",
+            payload=payload,
+            extra_headers={
+                "Idempotency-Key": idempotency_key,
+                "X-Trace-Id": trace_id,
+            },
+        )
+        if response is None:
+            return {}
+        if not isinstance(response, dict):
+            raise AilliumCoreClientError("status report response must be a JSON object")
+        return response
+
+    def submit_executor_result(self, task_id: str, result_payload: dict[str, Any]) -> dict[str, Any]:
+        """Legacy compatibility shim — delegates to report_executor_status.
+
+        Maps the old result payload shape to the new executor-status API.
+        """
+        execution_ref = result_payload.get("executionRef", f"exec-{task_id}")
+        executor_type = result_payload.get("executorType", "ui-tars")
+        trace_id = result_payload.get("traceId", str(uuid.uuid4()))
+
+        raw_status = result_payload.get("status", "failed")
+        status_map = {
+            "succeeded": "executor_succeeded",
+            "failed": "executor_failed",
+            "cancelled": "executor_cancelled",
+            "timed_out": "executor_timed_out",
+        }
+        status = status_map.get(raw_status, "executor_failed")
+
+        artifacts = None
+        result = result_payload.get("result")
+        if isinstance(result, dict):
+            raw_artifacts = result.get("artifacts", [])
+            if raw_artifacts:
+                artifacts = [{"uri": a["uri"]} for a in raw_artifacts if isinstance(a, dict) and "uri" in a]
+
+        return self.report_executor_status(
+            execution_ref=execution_ref,
+            executor_type=executor_type,
+            status=status,
+            trace_id=trace_id,
+            artifacts=artifacts,
+        )

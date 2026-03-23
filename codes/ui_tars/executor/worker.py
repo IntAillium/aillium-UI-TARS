@@ -20,6 +20,9 @@ from .schema_loader import SchemaLoadError, load_schemas
 
 TASK_TYPE_REMOTE_HANDSHAKE = "remote-handshake"
 
+# Default executor type used when polling the task-bus.
+DEFAULT_EXECUTOR_TYPE = "ui-tars"
+
 
 @dataclass(frozen=True)
 class WorkerContext:
@@ -33,6 +36,7 @@ class WorkerConfig:
     poll_interval_seconds: float
     idle_backoff_seconds: float
     task_type: str
+    executor_type: str
 
     @staticmethod
     def load_from_env() -> "WorkerConfig":
@@ -40,11 +44,13 @@ class WorkerConfig:
         poll_interval_seconds = float(os.getenv("AILLIUM_POLL_INTERVAL_SECONDS", "0.2"))
         idle_backoff_seconds = float(os.getenv("AILLIUM_IDLE_BACKOFF_SECONDS", "1.0"))
         task_type = os.getenv("AILLIUM_TASK_TYPE", TASK_TYPE_REMOTE_HANDSHAKE).strip()
+        executor_type = os.getenv("AILLIUM_EXECUTOR_TYPE", DEFAULT_EXECUTOR_TYPE).strip()
         return WorkerConfig(
             worker_id=worker_id,
             poll_interval_seconds=poll_interval_seconds,
             idle_backoff_seconds=idle_backoff_seconds,
             task_type=task_type,
+            executor_type=executor_type,
         )
 
 
@@ -112,15 +118,15 @@ def _build_failure_result(
     worker_id: str,
     request_payload: dict[str, Any],
     message: str,
+    execution_ref: str = "",
+    executor_type: str = "ui-tars",
+    trace_id: str = "",
 ) -> dict[str, Any]:
     return {
-        "worker_id": worker_id,
-        "workerId": worker_id,
-        "task_id": task_id,
-        "taskId": task_id,
-        "tenantId": request_payload.get("tenantId"),
-        "requestId": request_payload.get("requestId"),
-        "traceId": request_payload.get("traceId"),
+        "executionRef": execution_ref or f"exec-{task_id}",
+        "executorType": executor_type,
+        "traceId": trace_id or request_payload.get("traceId", ""),
+        "tenantId": request_payload.get("tenantId", ""),
         "status": "failed",
         "result": {
             "message": "Worker task failed before execution",
@@ -128,12 +134,12 @@ def _build_failure_result(
             "warnings": [message],
         },
         "error": {
-            "error": "worker_task_failed",
+            "code": "worker_task_failed",
             "message": message,
         },
+        "artifacts": [],
         "meta": {
             "worker_id": worker_id,
-            "workerId": worker_id,
         },
     }
 
@@ -162,10 +168,45 @@ def _emit_task_event(
 
 
 def process_task(task: dict[str, Any], context: WorkerContext, worker_id: str) -> tuple[str, dict[str, Any]]:
+    """Process a task from the task-bus.
+
+    The task dict comes from the task-bus poll response and contains:
+    taskId, executionRef, dispatchTarget, contractFamily,
+    expectedEvidenceKind, compatibilityMode, traceId, tenantId.
+
+    For backward compatibility, also supports the legacy shape with
+    type/payload fields.
+    """
     task_id = _extract_task_id(task)
-    task_type = _extract_task_type(task)
-    request_payload = _extract_request_payload(task)
-    correlation = _correlation_from_request(request_payload)
+    execution_ref = task.get("executionRef", f"exec-{task_id}")
+    executor_type = task.get("executorType", DEFAULT_EXECUTOR_TYPE)
+    trace_id = task.get("traceId", "")
+    tenant_id = task.get("tenantId", "")
+
+    # Extract task_type: from dispatchTarget hint or legacy field
+    dispatch_target = task.get("dispatchTarget", "")
+    if dispatch_target == "DEPRECATED_WORKER_COMPAT":
+        task_type = TASK_TYPE_REMOTE_HANDSHAKE
+    else:
+        task_type = _extract_task_type(task) if task.get("type") or task.get("taskType") or task.get("task_type") else TASK_TYPE_REMOTE_HANDSHAKE
+
+    # Build correlation from task-bus fields
+    correlation = Correlation(
+        tenant_id=tenant_id or None,
+        request_id=execution_ref,
+        trace_id=trace_id or None,
+    )
+
+    # Try to extract a request payload; for task-bus tasks this may not exist
+    # in which case we build a minimal one from the task-bus fields.
+    try:
+        request_payload = _extract_request_payload(task)
+    except ValueError:
+        request_payload = {
+            "tenantId": tenant_id,
+            "requestId": execution_ref,
+            "traceId": trace_id,
+        }
 
     if task_type != TASK_TYPE_REMOTE_HANDSHAKE:
         raise ValueError(f"unsupported task type: {task_type}")
@@ -201,23 +242,32 @@ def process_task(task: dict[str, Any], context: WorkerContext, worker_id: str) -
             worker_id=worker_id,
             request_payload=request_payload,
             message=str(exc),
+            execution_ref=execution_ref,
+            executor_type=executor_type,
+            trace_id=trace_id,
         )
 
+    # Build callback payload aligned with Core's executor-status API
+    result_status = result.get("status", "failed")
+    artifacts = []
+    result_data = result.get("result")
+    if isinstance(result_data, dict):
+        for a in result_data.get("artifacts", []):
+            if isinstance(a, dict) and "uri" in a:
+                artifacts.append({"uri": a["uri"]})
+
     callback_payload = {
-        "worker_id": worker_id,
-        "workerId": worker_id,
-        "task_id": task_id,
-        "taskId": task_id,
-        "tenantId": result.get("tenantId"),
-        "requestId": result.get("requestId"),
-        "traceId": result.get("traceId"),
-        "status": result.get("status"),
-        "result": result.get("result"),
+        "executionRef": execution_ref,
+        "executorType": executor_type,
+        "traceId": trace_id,
+        "tenantId": tenant_id,
+        "status": result_status,
+        "result": result_data,
         "error": result.get("error"),
+        "artifacts": artifacts,
         "meta": {
             **(result.get("meta") if isinstance(result.get("meta"), dict) else {}),
             "worker_id": worker_id,
-            "workerId": worker_id,
         },
     }
 
@@ -227,7 +277,7 @@ def process_task(task: dict[str, Any], context: WorkerContext, worker_id: str) -
         task_id=task_id,
         worker_id=worker_id,
         task_type=task_type,
-        status=str(callback_payload.get("status")),
+        status=str(result_status),
     )
     return task_id, callback_payload
 
@@ -239,6 +289,15 @@ def run_polling_loop(
     config: WorkerConfig | None = None,
     stop_after_iterations: int | None = None,
 ) -> None:
+    """Run the worker polling loop.
+
+    Loop sequence per iteration:
+    1. Poll task-bus for eligible tasks (POST /v1/task-bus/tasks:poll)
+    2. Claim lease on the task (POST /v1/task-bus/leases:claim)
+    3. Report executor_started status
+    4. Execute the task deterministically
+    5. Report executor_succeeded or executor_failed status with artifacts
+    """
     setup_logging()
 
     client = core_client or AilliumCoreClient()
@@ -253,13 +312,56 @@ def run_polling_loop(
         iterations += 1
 
         try:
-            task = client.poll_executor_task(worker_config.task_type)
+            # Step 1: Poll for tasks using executor_type
+            task = client.poll_executor_task(worker_config.executor_type)
             if task is None:
                 time.sleep(worker_config.idle_backoff_seconds)
                 continue
 
-            task_id, result_payload = process_task(task, worker_context, worker_config.worker_id)
-            client.submit_executor_result(task_id, result_payload)
+            task_id = _extract_task_id(task)
+            execution_ref = task.get("executionRef", f"exec-{task_id}")
+            trace_id = task.get("traceId", str(uuid.uuid4()))
+
+            # Step 2: Claim the lease
+            try:
+                client.claim_task_lease(
+                    task_id=task_id,
+                    executor_type=worker_config.executor_type,
+                )
+            except AilliumCoreRetryableError:
+                time.sleep(worker_config.poll_interval_seconds)
+                continue
+
+            # Step 3: Report executor_started
+            client.report_executor_status(
+                execution_ref=execution_ref,
+                executor_type=worker_config.executor_type,
+                status="executor_started",
+                trace_id=trace_id,
+            )
+
+            # Step 4: Execute the task
+            _task_id, result_payload = process_task(task, worker_context, worker_config.worker_id)
+
+            # Step 5: Report final status
+            raw_status = result_payload.get("status", "failed")
+            status_map = {
+                "succeeded": "executor_succeeded",
+                "failed": "executor_failed",
+                "cancelled": "executor_cancelled",
+                "timed_out": "executor_timed_out",
+            }
+            final_status = status_map.get(raw_status, "executor_failed")
+
+            artifacts = result_payload.get("artifacts")
+
+            client.report_executor_status(
+                execution_ref=execution_ref,
+                executor_type=worker_config.executor_type,
+                status=final_status,
+                trace_id=trace_id,
+                artifacts=artifacts if artifacts else None,
+            )
         except AilliumCoreRetryableError:
             time.sleep(worker_config.poll_interval_seconds)
         except Exception as exc:
