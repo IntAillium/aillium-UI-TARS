@@ -2,7 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 import re
 import ast
+import logging
 import math
+
+logger = logging.getLogger(__name__)
 
 IMAGE_FACTOR = 28
 MIN_PIXELS = 100 * 28 * 28
@@ -68,7 +71,7 @@ def parse_action(action_str):
         return {'function': func_name, 'args': kwargs}
 
     except Exception as e:
-        print(f"Failed to parse action '{action_str}': {e}")
+        logger.warning("Failed to parse action %r: %s", action_str, e)
         return None
 
 
@@ -224,13 +227,12 @@ def parse_action_to_structure_output(text,
     ]
     actions = []
     for action_instance, raw_str in zip(parsed_actions, all_action):
-        if action_instance == None:
-            print(f"Action can't parse: {raw_str}")
+        if action_instance is None:
+            logger.warning("Action can't parse: %s", raw_str)
             raise ValueError(f"Action can't parse: {raw_str}")
         action_type = action_instance["function"]
         params = action_instance["args"]
 
-        # import pdb; pdb.set_trace()
         action_inputs = {}
         for param_name, param in params.items():
             if param == "": continue
@@ -265,7 +267,6 @@ def parse_action_to_structure_output(text,
                     ]
                 action_inputs[param_name.strip()] = str(float_numbers)
 
-        # import pdb; pdb.set_trace()
         actions.append({
             "reflection": reflection,
             "thought": thought,

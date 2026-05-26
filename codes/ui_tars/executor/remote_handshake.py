@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 from datetime import datetime, timezone
 from typing import Any
@@ -9,6 +10,8 @@ from jsonschema import Draft202012Validator
 
 from .meshcentral_client import MeshCentralClient
 from .meshcentral_mock import MockMeshCentralClient
+
+logger = logging.getLogger(__name__)
 
 
 class RemoteHandshakeValidationError(ValueError):
@@ -21,7 +24,7 @@ class RemoteHandshakeExecutionError(RuntimeError):
 
     Option A expects:
     - Validation errors -> 400 (handled by server)
-    - Execution errors -> 200 with body.status="failed" (tests expect this)
+    - Execution errors -> 200 with body.status=\"failed\" (tests expect this)
     """
 
     def __init__(
@@ -180,7 +183,7 @@ def execute_remote_handshake(
             )
 
     except Exception as exc:
-        # Option A semantics: return 200 with status="failed"
+        # Option A semantics: return 200 with status=\"failed\"
         status = "failed"
         message = "Remote handshake failed"
         logs.append(
@@ -271,10 +274,19 @@ def execute_remote_handshake(
         },
     }
 
-    # NOTE: response_schema (executor.response.schema.json) is not validated here.
-    # The handshake response uses an ad-hoc shape (tenantId, requestId, timing, etc.)
-    # that does not conform to the canonical executor.response contract (which requires
-    # contract_type, response_id, completed_at, etc. with additionalProperties:false).
-    # Aligning the response shape is deferred to post-MVP. See contract-boundaries.md.
-    _ = response_schema
+    # The handshake response uses an ad-hoc shape that does not yet conform to
+    # the canonical executor.response contract (snake_case fields, contract_type,
+    # schema_version, etc.). Aligning the response shape is deferred to post-MVP.
+    # Until then, validate against the canonical schema in non-blocking mode so
+    # divergences are surfaced via logs instead of silently swallowed.
+    try:
+        response_validator = Draft202012Validator(response_schema)
+        errors = sorted(response_validator.iter_errors(response_payload), key=lambda e: e.path)
+        if errors:
+            logger.warning(
+                "remote_handshake response does not conform to canonical executor.response schema: %s",
+                "; ".join(f"{list(e.path)}: {e.message}" for e in errors[:5]),
+            )
+    except Exception as exc:  # noqa: BLE001 - non-blocking validation
+        logger.warning("remote_handshake response schema validation raised: %s", exc)
     return response_payload

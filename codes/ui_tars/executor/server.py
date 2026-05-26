@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -11,6 +12,8 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 
 from .audit import Correlation, emit, setup_logging
+
+logger = logging.getLogger(__name__)
 from .dry_run import build_dry_run_response
 from .remote_handshake import (
     RemoteHandshakeExecutionError,
@@ -196,7 +199,7 @@ def run() -> None:
     host = os.getenv("EXECUTOR_HOST", "0.0.0.0")
     port = int(os.getenv("EXECUTOR_PORT", "8080"))
     server = ThreadingHTTPServer((host, port), create_handler(context))
-    print(f"[DEPRECATED] Executor server listening on http://{host}:{port}; prefer poll worker mode")
+    logger.warning("[DEPRECATED] Executor server listening on http://%s:%d; prefer poll worker mode", host, port)
     server.serve_forever()
 
 
