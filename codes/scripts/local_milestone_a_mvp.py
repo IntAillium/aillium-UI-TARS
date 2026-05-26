@@ -164,6 +164,7 @@ def main() -> int:
                     poll_interval_seconds=0.01,
                     idle_backoff_seconds=0.01,
                     task_type=TASK_TYPE_REMOTE_HANDSHAKE,
+                    executor_type="ui-tars",
                 ),
                 stop_after_iterations=2,
             )
