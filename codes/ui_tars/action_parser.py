@@ -193,7 +193,8 @@ def parse_action_to_structure_output(text,
         elif len(thought_match.groups()) == 2:
             thought = thought_match.group(2).strip()
             reflection = thought_match.group(1).strip()
-    assert "Action:" in text
+    if "Action:" not in text:
+        raise ValueError("Model output is missing required 'Action:' marker")
     action_str = text.split("Action: ")[-1]
 
     tmp_all_action = action_str.split(")\n\n")
