@@ -7,6 +7,7 @@ can identify which tenant's tasks to poll and claim.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import uuid
@@ -189,14 +190,23 @@ class AilliumCoreClient:
         return task
 
     def claim_task_lease(
-        self, task_id: str, executor_type: str, visibility_timeout_seconds: int = 60
+        self,
+        task_id: str,
+        executor_type: str,
+        visibility_timeout_seconds: int = 60,
+        execution_ref: str | None = None,
+        attempt_id: str | None = None,
     ) -> dict[str, Any]:
         """Claim a lease on a polled task.
 
         Aligns with Core endpoint: POST /v1/task-bus/leases:claim
         Returns lease details including leaseToken and leaseExpiresAt.
         """
-        idempotency_key = str(uuid.uuid4())
+        # A retry after a transport failure must replay the same claim instead of
+        # creating a second semantic request with a fresh random key.
+        idempotency_key = (
+            f"claim:{task_id}:{execution_ref or task_id}:{attempt_id or task_id}"
+        )
         response = self._request(
             "POST",
             "/v1/task-bus/leases:claim",
@@ -213,6 +223,55 @@ class AilliumCoreClient:
             raise AilliumCoreClientError("claim response must be a JSON object")
         return response
 
+    def renew_task_lease(
+        self,
+        *,
+        task_id: str,
+        executor_type: str,
+        lease_token: str,
+        visibility_timeout_seconds: int = 60,
+    ) -> dict[str, Any]:
+        """Extend a live lease while the executor is still working."""
+        response = self._request(
+            "POST",
+            "/v1/task-bus/leases:renew",
+            payload={
+                "taskId": task_id,
+                "executorType": executor_type,
+                "visibilityTimeoutSeconds": visibility_timeout_seconds,
+            },
+            extra_headers={"X-Task-Lease-Token": lease_token},
+        )
+        if not isinstance(response, dict):
+            raise AilliumCoreClientError("lease renewal response must be a JSON object")
+        return response
+
+    def fetch_task_payload(self, *, task_id: str, lease_token: str) -> dict[str, Any]:
+        """Fetch task data through Core's lease-bound worker endpoint."""
+        task = parse.quote(task_id, safe="")
+        response = self._request(
+            "GET",
+            f"/v1/task-bus/tasks/{task}/payload",
+            extra_headers={"X-Task-Lease-Token": lease_token},
+        )
+        if not isinstance(response, dict):
+            raise AilliumCoreClientError("task payload response must be a JSON object")
+        return response
+
+    def fetch_execution_plan(
+        self, *, execution_ref: str, lease_token: str
+    ) -> dict[str, Any]:
+        """Fetch an execution plan through Core's lease-bound worker endpoint."""
+        ref = parse.quote(execution_ref, safe="")
+        response = self._request(
+            "GET",
+            f"/v1/task-bus/execution-plans/{ref}",
+            extra_headers={"X-Task-Lease-Token": lease_token},
+        )
+        if not isinstance(response, dict):
+            raise AilliumCoreClientError("execution plan response must be a JSON object")
+        return response
+
     def report_executor_status(
         self,
         *,
@@ -220,6 +279,8 @@ class AilliumCoreClient:
         executor_type: str,
         status: str,
         trace_id: str,
+        lease_token: str,
+        task_id: str | None = None,
         artifacts: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         """Report executor status back to the task-bus.
@@ -228,7 +289,14 @@ class AilliumCoreClient:
         Status values: executor_contract_accepted, executor_contract_rejected,
         executor_started, executor_succeeded, executor_failed, executor_timed_out
         """
-        idempotency_key = str(uuid.uuid4())
+        # Bind callback replay to the lease attempt. A reclaimed task has a new
+        # token and must not collide with an earlier attempt's status key. Only
+        # a one-way digest is used so the bearer lease never enters logs.
+        attempt_fingerprint = hashlib.sha256(lease_token.encode("utf-8")).hexdigest()[:24]
+        idempotency_key = (
+            f"status:{task_id or execution_ref}:{execution_ref}:"
+            f"{attempt_fingerprint}:{status}"
+        )
         payload: dict[str, Any] = {
             "executionRef": execution_ref,
             "executorType": executor_type,
@@ -245,6 +313,7 @@ class AilliumCoreClient:
             extra_headers={
                 "Idempotency-Key": idempotency_key,
                 "X-Trace-Id": trace_id,
+                "X-Task-Lease-Token": lease_token,
             },
         )
         if response is None:
@@ -261,6 +330,9 @@ class AilliumCoreClient:
         execution_ref = result_payload.get("executionRef", f"exec-{task_id}")
         executor_type = result_payload.get("executorType", "ui-tars")
         trace_id = result_payload.get("traceId", str(uuid.uuid4()))
+        lease_token = result_payload.get("leaseToken", "")
+        if not isinstance(lease_token, str) or not lease_token.strip():
+            raise AilliumCoreClientError("leaseToken is required for executor callbacks")
 
         raw_status = result_payload.get("status", "failed")
         status_map = {
@@ -283,5 +355,7 @@ class AilliumCoreClient:
             executor_type=executor_type,
             status=status,
             trace_id=trace_id,
+            lease_token=lease_token,
+            task_id=task_id,
             artifacts=artifacts,
         )

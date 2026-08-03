@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
@@ -37,6 +38,8 @@ class WorkerConfig:
     idle_backoff_seconds: float
     task_type: str
     executor_type: str
+    visibility_timeout_seconds: int = 60
+    lease_renew_interval_seconds: float = 20.0
 
     @staticmethod
     def load_from_env() -> "WorkerConfig":
@@ -45,13 +48,79 @@ class WorkerConfig:
         idle_backoff_seconds = float(os.getenv("AILLIUM_IDLE_BACKOFF_SECONDS", "1.0"))
         task_type = os.getenv("AILLIUM_TASK_TYPE", TASK_TYPE_REMOTE_HANDSHAKE).strip()
         executor_type = os.getenv("AILLIUM_EXECUTOR_TYPE", DEFAULT_EXECUTOR_TYPE).strip()
+        visibility_timeout_seconds = int(
+            os.getenv("AILLIUM_VISIBILITY_TIMEOUT_SECONDS", "60")
+        )
+        lease_renew_interval_seconds = float(
+            os.getenv(
+                "AILLIUM_LEASE_RENEW_INTERVAL_SECONDS",
+                str(max(1.0, visibility_timeout_seconds / 3)),
+            )
+        )
         return WorkerConfig(
             worker_id=worker_id,
             poll_interval_seconds=poll_interval_seconds,
             idle_backoff_seconds=idle_backoff_seconds,
             task_type=task_type,
             executor_type=executor_type,
+            visibility_timeout_seconds=visibility_timeout_seconds,
+            lease_renew_interval_seconds=lease_renew_interval_seconds,
         )
+
+
+class _LeaseRenewer:
+    """Renew a lease in the background for the full execution window."""
+
+    def __init__(
+        self,
+        *,
+        client: AilliumCoreClient,
+        task_id: str,
+        executor_type: str,
+        lease_token: str,
+        visibility_timeout_seconds: int,
+        interval_seconds: float,
+    ):
+        self._client = client
+        self._task_id = task_id
+        self._executor_type = executor_type
+        self._lease_token = lease_token
+        self._visibility_timeout_seconds = visibility_timeout_seconds
+        self._interval_seconds = max(0.01, interval_seconds)
+        self._stop = threading.Event()
+        self._error: Exception | None = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"lease-renewer-{task_id}",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=max(1.0, self._interval_seconds + 0.5))
+
+    def assert_active(self) -> None:
+        if self._error is not None:
+            raise AilliumCoreRetryableError(
+                f"task lease renewal failed: {self._error}"
+            ) from self._error
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval_seconds):
+            try:
+                self._client.renew_task_lease(
+                    task_id=self._task_id,
+                    executor_type=self._executor_type,
+                    lease_token=self._lease_token,
+                    visibility_timeout_seconds=self._visibility_timeout_seconds,
+                )
+            except Exception as exc:  # surfaced synchronously by assert_active
+                self._error = exc
+                self._stop.set()
+                return
 
 
 def _load_or_create_worker_id() -> str:
@@ -167,7 +236,12 @@ def _emit_task_event(
     emit(event, correlation, **payload)
 
 
-def process_task(task: dict[str, Any], context: WorkerContext, worker_id: str) -> tuple[str, dict[str, Any]]:
+def process_task(
+    task: dict[str, Any],
+    context: WorkerContext,
+    worker_id: str,
+    lease_checkpoint: Callable[[], None] | None = None,
+) -> tuple[str, dict[str, Any]]:
     """Process a task from the task-bus.
 
     The task dict comes from the task-bus poll response and contains:
@@ -226,6 +300,7 @@ def process_task(task: dict[str, Any], context: WorkerContext, worker_id: str) -
             request_validator=context.request_validator,
             response_schema=context.response_schema,
             headers={},
+            lease_checkpoint=lease_checkpoint,
         )
     except (ValidationError, RemoteHandshakeValidationError) as exc:
         _emit_task_event(
@@ -324,44 +399,85 @@ def run_polling_loop(
 
             # Step 2: Claim the lease
             try:
-                client.claim_task_lease(
+                lease = client.claim_task_lease(
                     task_id=task_id,
                     executor_type=worker_config.executor_type,
+                    visibility_timeout_seconds=worker_config.visibility_timeout_seconds,
+                    execution_ref=execution_ref,
+                    attempt_id=trace_id,
                 )
             except AilliumCoreRetryableError:
                 time.sleep(worker_config.poll_interval_seconds)
                 continue
 
-            # Step 3: Report executor_started
-            client.report_executor_status(
-                execution_ref=execution_ref,
-                executor_type=worker_config.executor_type,
-                status="executor_started",
-                trace_id=trace_id,
+            lease_token = lease.get("leaseToken")
+            if not isinstance(lease_token, str) or not lease_token.strip():
+                raise ValueError("claim response missing leaseToken")
+
+            # Poll responses intentionally contain dispatch metadata only. Task
+            # content is released after claim through the lease-bound endpoint.
+            task_payload = client.fetch_task_payload(
+                task_id=task_id,
+                lease_token=lease_token,
             )
-
-            # Step 4: Execute the task
-            _task_id, result_payload = process_task(task, worker_context, worker_config.worker_id)
-
-            # Step 5: Report final status
-            raw_status = result_payload.get("status", "failed")
-            status_map = {
-                "succeeded": "executor_succeeded",
-                "failed": "executor_failed",
-                "cancelled": "executor_cancelled",
-                "timed_out": "executor_timed_out",
+            task = {
+                **task,
+                "payload": task_payload.get("payload"),
+                "conversationKey": task_payload.get("conversationKey"),
             }
-            final_status = status_map.get(raw_status, "executor_failed")
 
-            artifacts = result_payload.get("artifacts")
-
-            client.report_executor_status(
-                execution_ref=execution_ref,
+            renewer = _LeaseRenewer(
+                client=client,
+                task_id=task_id,
                 executor_type=worker_config.executor_type,
-                status=final_status,
-                trace_id=trace_id,
-                artifacts=artifacts if artifacts else None,
+                lease_token=lease_token,
+                visibility_timeout_seconds=worker_config.visibility_timeout_seconds,
+                interval_seconds=worker_config.lease_renew_interval_seconds,
             )
+            renewer.start()
+            try:
+                # Step 3: Report executor_started
+                client.report_executor_status(
+                    execution_ref=execution_ref,
+                    executor_type=worker_config.executor_type,
+                    status="executor_started",
+                    trace_id=trace_id,
+                    lease_token=lease_token,
+                    task_id=task_id,
+                )
+
+                # Step 4: Execute the task
+                _task_id, result_payload = process_task(
+                    task,
+                    worker_context,
+                    worker_config.worker_id,
+                    lease_checkpoint=renewer.assert_active,
+                )
+                renewer.assert_active()
+
+                # Step 5: Report final status
+                raw_status = result_payload.get("status", "failed")
+                status_map = {
+                    "succeeded": "executor_succeeded",
+                    "failed": "executor_failed",
+                    "cancelled": "executor_cancelled",
+                    "timed_out": "executor_timed_out",
+                }
+                final_status = status_map.get(raw_status, "executor_failed")
+
+                artifacts = result_payload.get("artifacts")
+
+                client.report_executor_status(
+                    execution_ref=execution_ref,
+                    executor_type=worker_config.executor_type,
+                    status=final_status,
+                    trace_id=trace_id,
+                    lease_token=lease_token,
+                    task_id=task_id,
+                    artifacts=artifacts if artifacts else None,
+                )
+            finally:
+                renewer.stop()
         except AilliumCoreRetryableError:
             time.sleep(worker_config.poll_interval_seconds)
         except Exception as exc:

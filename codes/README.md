@@ -215,7 +215,10 @@ PYTHONPATH=. MESHCENTRAL_MOCK=1 python -m ui_tars.executor.worker
 
 Required env vars:
 - `AILLIUM_CORE_BASE_URL`
-- `AILLIUM_CORE_TOKEN`
+- `AILLIUM_CORE_TOKEN` (a pre-issued JWT with `principal_type=WORKER`; human
+  login tokens and development bypass tokens are rejected)
+- `AILLIUM_TENANT_ID` (must match both the token's tenant claim and Core's
+  `AILLIUM_WORKER_PRINCIPAL_SCOPES` entry)
 
 Optional env vars:
 - `AILLIUM_CORE_TIMEOUT_SECONDS` (default `10`)
@@ -224,6 +227,13 @@ Optional env vars:
 - `AILLIUM_WORKER_ID` (or auto-generated and persisted)
 - `AILLIUM_WORKER_ID_FILE` (default `~/.aillium-worker-id`)
 - `AILLIUM_TASK_TYPE` (default `remote-handshake`)
+- `AILLIUM_EXECUTOR_TYPE` (default `ui-tars`)
+- `AILLIUM_VISIBILITY_TIMEOUT_SECONDS` (default `60`)
+- `AILLIUM_LEASE_RENEW_INTERVAL_SECONDS` (default: one third of the visibility
+  timeout)
+
+The worker keeps the lease token returned by Core, uses lease-bound payload and
+callback endpoints, and renews the lease throughout long-running execution.
 
 ### End-to-end local MVP harness
 

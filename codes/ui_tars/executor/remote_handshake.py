@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from jsonschema import Draft202012Validator
 
@@ -37,6 +37,19 @@ class RemoteHandshakeExecutionError(RuntimeError):
         self.error = error
         self.reason_code = reason_code
         self.retryable = retryable
+
+
+class RemoteHandshakeLeaseLostError(RuntimeError):
+    """Raised when Core can no longer confirm this worker owns the task."""
+
+
+def _assert_lease(checkpoint: Callable[[], None] | None) -> None:
+    if checkpoint is None:
+        return
+    try:
+        checkpoint()
+    except Exception as exc:
+        raise RemoteHandshakeLeaseLostError(str(exc)) from exc
 
 
 def _now() -> datetime:
@@ -81,6 +94,7 @@ def execute_remote_handshake(
     response_schema: dict[str, Any],
     headers: dict[str, str],
     client: MeshCentralClient | None = None,
+    lease_checkpoint: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     # Validate against canonical executor.request schema
     request_validator.validate(request_payload)
@@ -131,8 +145,10 @@ def execute_remote_handshake(
     ]
 
     try:
+        _assert_lease(lease_checkpoint)
         handshake_client.open_session(mesh_node_id)
 
+        _assert_lease(lease_checkpoint)
         metadata_payload = handshake_client.fetch_session_metadata(mesh_node_id)
         logs.append(
             {
@@ -149,6 +165,7 @@ def execute_remote_handshake(
         )
 
         # Best-effort screenshot; do not fail handshake if it errors
+        _assert_lease(lease_checkpoint)
         try:
             screenshot_payload = handshake_client.capture_screenshot(mesh_node_id)
             logs.append(
@@ -179,6 +196,11 @@ def execute_remote_handshake(
                 }
             )
 
+        _assert_lease(lease_checkpoint)
+    except RemoteHandshakeLeaseLostError:
+        # Lease loss is a fencing event, not a business failure. Propagate it so
+        # the worker publishes no result and lets the new owner continue.
+        raise
     except Exception as exc:
         # Option A semantics: return 200 with status="failed"
         status = "failed"
@@ -276,5 +298,6 @@ def execute_remote_handshake(
     # that does not conform to the canonical executor.response contract (which requires
     # contract_type, response_id, completed_at, etc. with additionalProperties:false).
     # Aligning the response shape is deferred to post-MVP. See contract-boundaries.md.
+    _assert_lease(lease_checkpoint)
     _ = response_schema
     return response_payload

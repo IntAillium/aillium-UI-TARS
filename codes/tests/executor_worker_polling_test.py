@@ -1,5 +1,7 @@
+import hashlib
 import json
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
@@ -13,6 +15,10 @@ try:
         build_context,
         process_task,
         run_polling_loop,
+    )
+    from ui_tars.executor.remote_handshake import (
+        RemoteHandshakeLeaseLostError,
+        execute_remote_handshake,
     )
 
     _IMPORT_ERROR = None
@@ -76,7 +82,9 @@ class _CoreState:
         }
         self.task_claimed = False
         self.lease_responses = []
+        self.lease_renewals = []
         self.status_events = []
+        self.request_headers = []
         self.audit_events = []
 
     def poll(self):
@@ -85,7 +93,7 @@ class _CoreState:
                 return None
             return self.task_with_payload
 
-    def claim(self, body: dict):
+    def claim(self, body: dict, headers):
         with self._lock:
             task_id = body.get("taskId", "")
             self.task_claimed = True
@@ -96,12 +104,33 @@ class _CoreState:
                 "visibilityTimeoutSeconds": 60,
             }
             self.lease_responses.append(resp)
+            self.request_headers.append(("claim", dict(headers)))
             self.audit_events.append({"event": "task.claimed", "task_id": task_id})
             return resp
 
-    def report_status(self, body: dict):
+    def renew(self, body: dict, headers):
+        with self._lock:
+            self.lease_renewals.append(body)
+            self.request_headers.append(("renew", dict(headers)))
+            return {
+                "taskId": body.get("taskId"),
+                "leaseExpiresAt": "2099-01-01T00:00:00Z",
+                "visibilityTimeoutSeconds": body.get("visibilityTimeoutSeconds", 60),
+            }
+
+    def payload(self, task_id: str, headers):
+        with self._lock:
+            self.request_headers.append(("payload", dict(headers)))
+            return {
+                "id": task_id,
+                "payload": self.task_with_payload["payload"],
+                "conversationKey": "conversation-1",
+            }
+
+    def report_status(self, body: dict, headers):
         with self._lock:
             self.status_events.append(body)
+            self.request_headers.append(("status", dict(headers)))
             status = body.get("status", "")
             self.audit_events.append({
                 "event": "task.status_reported",
@@ -144,7 +173,16 @@ class ExecutorPollingTest(unittest.TestCase):
 
                 if self.path == "/v1/task-bus/leases:claim":
                     body = self._read_body()
-                    resp = state.claim(body)
+                    resp = state.claim(body, self.headers)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps(resp).encode("utf-8"))
+                    return
+
+                if self.path == "/v1/task-bus/leases:renew":
+                    body = self._read_body()
+                    resp = state.renew(body, self.headers)
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
@@ -153,13 +191,27 @@ class ExecutorPollingTest(unittest.TestCase):
 
                 if self.path == "/v1/task-bus/executor-status":
                     body = self._read_body()
-                    resp = state.report_status(body)
+                    resp = state.report_status(body, self.headers)
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
                     self.wfile.write(json.dumps(resp).encode("utf-8"))
                     return
 
+                self.send_response(404)
+                self.end_headers()
+
+            def do_GET(self):  # noqa: N802
+                prefix = "/v1/task-bus/tasks/"
+                suffix = "/payload"
+                if self.path.startswith(prefix) and self.path.endswith(suffix):
+                    task_id = self.path[len(prefix) : -len(suffix)]
+                    resp = state.payload(task_id, self.headers)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps(resp).encode("utf-8"))
+                    return
                 self.send_response(404)
                 self.end_headers()
 
@@ -317,13 +369,35 @@ class ExecutorPollingTest(unittest.TestCase):
                         idle_backoff_seconds=0.01,
                         task_type=TASK_TYPE_REMOTE_HANDSHAKE,
                         executor_type="ui-tars",
+                        visibility_timeout_seconds=60,
+                        lease_renew_interval_seconds=20,
                     ),
-                    stop_after_iterations=2,
+                    stop_after_iterations=1,
                 )
 
             # Verify lease was claimed
             self.assertTrue(state.task_claimed)
             self.assertTrue(len(state.lease_responses) > 0)
+
+            claim_headers = next(
+                headers for kind, headers in state.request_headers if kind == "claim"
+            )
+            started_headers = next(
+                headers
+                for kind, headers in state.request_headers
+                if kind == "status" and headers.get("X-Trace-Id")
+            )
+            self.assertEqual(
+                claim_headers["Idempotency-Key"],
+                f"claim:task-1:exec-1:{started_headers['X-Trace-Id']}",
+            )
+
+            payload_headers = next(
+                headers for kind, headers in state.request_headers if kind == "payload"
+            )
+            self.assertEqual(
+                payload_headers["X-Task-Lease-Token"], "lease_task-1_test"
+            )
 
             # Verify status events were reported
             status_names = [e.get("status") for e in state.status_events]
@@ -332,12 +406,174 @@ class ExecutorPollingTest(unittest.TestCase):
             terminal = {"executor_succeeded", "executor_failed"}
             self.assertTrue(terminal & set(status_names), f"Expected terminal status in {status_names}")
 
+            status_headers = [
+                headers for kind, headers in state.request_headers if kind == "status"
+            ]
+            self.assertTrue(status_headers)
+            self.assertTrue(
+                all(
+                    headers["X-Task-Lease-Token"] == "lease_task-1_test"
+                    for headers in status_headers
+                )
+            )
+            self.assertEqual(
+                [headers["Idempotency-Key"] for headers in status_headers],
+                [
+                    "status:task-1:exec-1:"
+                    f"{hashlib.sha256(b'lease_task-1_test').hexdigest()[:24]}:"
+                    "executor_started",
+                    "status:task-1:exec-1:"
+                    f"{hashlib.sha256(b'lease_task-1_test').hexdigest()[:24]}:"
+                    "executor_succeeded",
+                ],
+            )
+
             # Verify audit trail
             event_names = [e["event"] for e in state.audit_events]
             self.assertIn("task.claimed", event_names)
             self.assertIn("task.status_reported", event_names)
         finally:
             server.shutdown()
+            server.server_close()
+
+    def test_status_idempotency_is_stable_per_attempt_and_distinct_after_reclaim(self):
+        client = AilliumCoreClient(
+            AilliumCoreConfig(
+                base_url="http://core.invalid",
+                token="worker.jwt.token",
+                tenant_id="tenant-1",
+                timeout_seconds=2,
+            )
+        )
+        requests = []
+
+        def capture(method, path, payload=None, query=None, extra_headers=None):
+            requests.append((payload, extra_headers))
+            return {"accepted": True}
+
+        with patch.object(client, "_request", side_effect=capture):
+            for trace_id, lease_token in (
+                ("trace-attempt-1", "lease-attempt-1"),
+                ("trace-attempt-1", "lease-attempt-1"),
+                ("trace-attempt-2", "lease-attempt-2"),
+            ):
+                client.report_executor_status(
+                    execution_ref="exec-1",
+                    executor_type="ui-tars",
+                    status="executor_started",
+                    trace_id=trace_id,
+                    lease_token=lease_token,
+                    task_id="task-1",
+                )
+
+        keys = [headers["Idempotency-Key"] for _, headers in requests]
+        self.assertEqual(keys[0], keys[1])
+        self.assertNotEqual(keys[0], keys[2])
+        self.assertNotIn("lease-attempt", " ".join(keys))
+
+    def test_polling_loop_renews_lease_during_long_execution(self):
+        state = _CoreState()
+        server, port = self._start_core_server(state)
+        try:
+            client = AilliumCoreClient(
+                AilliumCoreConfig(
+                    base_url=f"http://127.0.0.1:{port}",
+                    token="worker.jwt.token",
+                    tenant_id="tenant-1",
+                    timeout_seconds=2,
+                )
+            )
+
+            def slow_process(task, context, worker_id, lease_checkpoint=None):
+                time.sleep(0.05)
+                return process_task(
+                    task,
+                    context,
+                    worker_id,
+                    lease_checkpoint=lease_checkpoint,
+                )
+
+            with patch.dict("os.environ", {"MESHCENTRAL_MOCK": "1"}, clear=False):
+                with patch(
+                    "ui_tars.executor.worker.process_task", side_effect=slow_process
+                ):
+                    run_polling_loop(
+                        core_client=client,
+                        context=self._context(),
+                        config=WorkerConfig(
+                            worker_id="worker-fixed",
+                            poll_interval_seconds=0.01,
+                            idle_backoff_seconds=0.01,
+                            task_type=TASK_TYPE_REMOTE_HANDSHAKE,
+                            executor_type="ui-tars",
+                            visibility_timeout_seconds=1,
+                            lease_renew_interval_seconds=0.01,
+                        ),
+                        stop_after_iterations=1,
+                    )
+
+            self.assertGreaterEqual(len(state.lease_renewals), 1)
+            renew_headers = [
+                headers for kind, headers in state.request_headers if kind == "renew"
+            ]
+            self.assertTrue(
+                all(
+                    headers["X-Task-Lease-Token"] == "lease_task-1_test"
+                    for headers in renew_headers
+                )
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_lease_loss_fences_later_meshcentral_operations(self):
+        context = self._context()
+        request_payload = {
+            "tenantId": "tenant-1",
+            "requestId": "req-fenced",
+            "traceId": "trace-fenced",
+            "deviceId": "device-1",
+            "meta": {"meshcentral_node_id": "node-1"},
+        }
+
+        class RecordingClient:
+            def __init__(self):
+                self.calls = []
+
+            def open_session(self, mesh_node_id):
+                self.calls.append("open")
+
+            def fetch_session_metadata(self, mesh_node_id):
+                self.calls.append("metadata")
+                return {}
+
+            def capture_screenshot(self, mesh_node_id):
+                self.calls.append("screenshot")
+                return {}
+
+            def close_session(self, mesh_node_id):
+                self.calls.append("close")
+
+        recording = RecordingClient()
+        checkpoints = 0
+
+        def failed_renewal_checkpoint():
+            nonlocal checkpoints
+            checkpoints += 1
+            if checkpoints == 2:
+                raise RuntimeError("lease renewal rejected")
+
+        with self.assertRaises(RemoteHandshakeLeaseLostError):
+            execute_remote_handshake(
+                request_payload=request_payload,
+                request_validator=context.request_validator,
+                response_schema=context.response_schema,
+                headers={},
+                client=recording,
+                lease_checkpoint=failed_renewal_checkpoint,
+            )
+
+        self.assertEqual(recording.calls, ["open", "close"])
 
 
 if __name__ == "__main__":
