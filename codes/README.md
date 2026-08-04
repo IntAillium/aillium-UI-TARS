@@ -231,9 +231,19 @@ Optional env vars:
 - `AILLIUM_VISIBILITY_TIMEOUT_SECONDS` (default `60`)
 - `AILLIUM_LEASE_RENEW_INTERVAL_SECONDS` (default: one third of the visibility
   timeout)
+- `AILLIUM_COMMAND_POLL_INTERVAL_SECONDS` (default and maximum `0.25`; keeps
+  cooperative cancellation inside the two-second acknowledgement budget)
+- `AILLIUM_CANCELLABLE_IO_TIMEOUT_SECONDS` (default and maximum `0.75`; bounds
+  each transitional MeshCentral call so its session can be closed before an
+  `executor_cancelled` acknowledgement)
 
 The worker keeps the lease token returned by Core, uses lease-bound payload and
-callback endpoints, and renews the lease throughout long-running execution.
+callback endpoints, polls lease commands, and renews the lease throughout
+long-running execution. A cancellation command must advance both the lease
+fence and cancellation generation. The worker stops side effects, confirms all
+registered transport teardown callbacks, and only then reports the fenced
+`executor_cancelled` acknowledgement. Any rejected renewal, stale command, or
+late callback is treated as a hard fence.
 
 ### End-to-end local MVP harness
 

@@ -5,14 +5,25 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 
-from .aillium_core_client import AilliumCoreClient, AilliumCoreRetryableError
+from .aillium_core_client import (
+    AilliumCoreClient,
+    AilliumCoreClientError,
+    AilliumCoreLeaseFencedError,
+    AilliumCoreRetryableError,
+)
 from .audit import Correlation, emit, setup_logging
+from .cancellation import (
+    CancellationCommand,
+    CancellationScope,
+    TaskCancellationRequested,
+)
 from .remote_handshake import (
     RemoteHandshakeValidationError,
     execute_remote_handshake,
@@ -40,6 +51,7 @@ class WorkerConfig:
     executor_type: str
     visibility_timeout_seconds: int = 60
     lease_renew_interval_seconds: float = 20.0
+    command_poll_interval_seconds: float = 0.25
 
     @staticmethod
     def load_from_env() -> "WorkerConfig":
@@ -57,6 +69,9 @@ class WorkerConfig:
                 str(max(1.0, visibility_timeout_seconds / 3)),
             )
         )
+        command_poll_interval_seconds = float(
+            os.getenv("AILLIUM_COMMAND_POLL_INTERVAL_SECONDS", "0.25")
+        )
         return WorkerConfig(
             worker_id=worker_id,
             poll_interval_seconds=poll_interval_seconds,
@@ -65,11 +80,12 @@ class WorkerConfig:
             executor_type=executor_type,
             visibility_timeout_seconds=visibility_timeout_seconds,
             lease_renew_interval_seconds=lease_renew_interval_seconds,
+            command_poll_interval_seconds=command_poll_interval_seconds,
         )
 
 
-class _LeaseRenewer:
-    """Renew a lease in the background for the full execution window."""
+class _LeaseController:
+    """Poll commands and renew a fenced lease for the execution window."""
 
     def __init__(
         self,
@@ -80,6 +96,10 @@ class _LeaseRenewer:
         lease_token: str,
         visibility_timeout_seconds: int,
         interval_seconds: float,
+        command_poll_interval_seconds: float,
+        initial_fence_token: int,
+        initial_cancellation_generation: int,
+        cancellation_scope: CancellationScope,
     ):
         self._client = client
         self._task_id = task_id
@@ -87,6 +107,12 @@ class _LeaseRenewer:
         self._lease_token = lease_token
         self._visibility_timeout_seconds = visibility_timeout_seconds
         self._interval_seconds = max(0.01, interval_seconds)
+        self._command_poll_interval_seconds = min(
+            0.25, max(0.01, command_poll_interval_seconds)
+        )
+        self._initial_fence_token = initial_fence_token
+        self._initial_cancellation_generation = initial_cancellation_generation
+        self._cancellation_scope = cancellation_scope
         self._stop = threading.Event()
         self._error: Exception | None = None
         self._thread = threading.Thread(
@@ -103,20 +129,126 @@ class _LeaseRenewer:
         self._thread.join(timeout=max(1.0, self._interval_seconds + 0.5))
 
     def assert_active(self) -> None:
+        self._cancellation_scope.checkpoint()
         if self._error is not None:
             raise AilliumCoreRetryableError(
-                f"task lease renewal failed: {self._error}"
+                f"task lease control failed: {self._error}"
             ) from self._error
 
-    def _run(self) -> None:
-        while not self._stop.wait(self._interval_seconds):
-            try:
-                self._client.renew_task_lease(
-                    task_id=self._task_id,
-                    executor_type=self._executor_type,
-                    lease_token=self._lease_token,
-                    visibility_timeout_seconds=self._visibility_timeout_seconds,
+    def synchronize_after_fence(self) -> None:
+        """Resolve a 409 into a validated cancel command or hard lease loss."""
+        try:
+            self._poll_commands()
+        except Exception as exc:
+            self._error = exc
+        self.assert_active()
+
+    @staticmethod
+    def _parse_requested_at(raw: object) -> datetime:
+        if not isinstance(raw, str) or not raw.strip():
+            raise AilliumCoreClientError("cancel command requestedAt must be an ISO timestamp")
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise AilliumCoreClientError(
+                "cancel command requestedAt must be an ISO timestamp"
+            ) from exc
+
+    def _poll_commands(self) -> None:
+        response = self._client.poll_task_commands(
+            task_id=self._task_id,
+            executor_type=self._executor_type,
+            lease_token=self._lease_token,
+        )
+        if response.get("taskId") != self._task_id:
+            raise AilliumCoreClientError("task command response identity mismatch")
+
+        fence_token = response.get("fenceToken")
+        cancellation_generation = response.get("cancellationGeneration")
+        commands = response.get("commands")
+        if not isinstance(fence_token, int) or isinstance(fence_token, bool):
+            raise AilliumCoreClientError("task command response fenceToken must be an integer")
+        if not isinstance(cancellation_generation, int) or isinstance(
+            cancellation_generation, bool
+        ):
+            raise AilliumCoreClientError(
+                "task command response cancellationGeneration must be an integer"
+            )
+        if not isinstance(commands, list):
+            raise AilliumCoreClientError("task command response commands must be an array")
+
+        if not commands:
+            if (
+                fence_token != self._initial_fence_token
+                or cancellation_generation != self._initial_cancellation_generation
+            ):
+                raise AilliumCoreClientError(
+                    "task lease generation advanced without a cancellation command"
                 )
+            return
+        if len(commands) != 1 or not isinstance(commands[0], dict):
+            raise AilliumCoreClientError("task command response must contain one command")
+        command = commands[0]
+        if command.get("type") != "cancel":
+            raise AilliumCoreClientError("unsupported task command")
+        if fence_token <= self._initial_fence_token:
+            raise AilliumCoreClientError("cancel command did not advance the lease fence")
+        if cancellation_generation <= self._initial_cancellation_generation:
+            raise AilliumCoreClientError("cancel command did not advance cancellation generation")
+
+        reason = command.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise AilliumCoreClientError("cancel command reason must be a non-empty string")
+        self._cancellation_scope.cancel(
+            CancellationCommand(
+                task_id=self._task_id,
+                fence_token=fence_token,
+                cancellation_generation=cancellation_generation,
+                requested_at=self._parse_requested_at(command.get("requestedAt")),
+                reason=reason.strip(),
+            )
+        )
+
+    def _run(self) -> None:
+        next_renewal = time.monotonic() + self._interval_seconds
+        last_control_success = time.monotonic()
+        control_interval = min(
+            self._command_poll_interval_seconds, self._interval_seconds
+        )
+        while not self._stop.wait(control_interval):
+            try:
+                self._poll_commands()
+                last_control_success = time.monotonic()
+                if self._cancellation_scope.command is not None:
+                    self._stop.set()
+                    return
+                if time.monotonic() >= next_renewal:
+                    self._client.renew_task_lease(
+                        task_id=self._task_id,
+                        executor_type=self._executor_type,
+                        lease_token=self._lease_token,
+                        visibility_timeout_seconds=self._visibility_timeout_seconds,
+                    )
+                    next_renewal = time.monotonic() + self._interval_seconds
+                    last_control_success = time.monotonic()
+            except AilliumCoreLeaseFencedError:
+                try:
+                    self._poll_commands()
+                except Exception as exc:
+                    self._error = exc
+                if self._cancellation_scope.command is None and self._error is None:
+                    self._error = AilliumCoreLeaseFencedError(
+                        "lease was fenced without a cancellation command"
+                    )
+                self._stop.set()
+                return
+            except AilliumCoreRetryableError as exc:
+                # One transport reset must not manufacture cancellation, but a
+                # worker that cannot confirm its fence for 500 ms must stop.
+                if time.monotonic() - last_control_success >= 0.5:
+                    self._error = exc
+                    self._stop.set()
+                    return
             except Exception as exc:  # surfaced synchronously by assert_active
                 self._error = exc
                 self._stop.set()
@@ -241,6 +373,7 @@ def process_task(
     context: WorkerContext,
     worker_id: str,
     lease_checkpoint: Callable[[], None] | None = None,
+    cancellation_scope: CancellationScope | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Process a task from the task-bus.
 
@@ -301,6 +434,7 @@ def process_task(
             response_schema=context.response_schema,
             headers={},
             lease_checkpoint=lease_checkpoint,
+            cancellation_scope=cancellation_scope,
         )
     except (ValidationError, RemoteHandshakeValidationError) as exc:
         _emit_task_event(
@@ -414,28 +548,60 @@ def run_polling_loop(
             if not isinstance(lease_token, str) or not lease_token.strip():
                 raise ValueError("claim response missing leaseToken")
 
-            # Poll responses intentionally contain dispatch metadata only. Task
-            # content is released after claim through the lease-bound endpoint.
-            task_payload = client.fetch_task_payload(
-                task_id=task_id,
-                lease_token=lease_token,
-            )
-            task = {
-                **task,
-                "payload": task_payload.get("payload"),
-                "conversationKey": task_payload.get("conversationKey"),
-            }
+            fence_token = lease.get("fenceToken")
+            cancellation_generation = lease.get("cancellationGeneration")
+            if not isinstance(fence_token, int) or isinstance(fence_token, bool):
+                raise ValueError("claim response missing numeric fenceToken")
+            if not isinstance(cancellation_generation, int) or isinstance(
+                cancellation_generation, bool
+            ):
+                raise ValueError("claim response missing numeric cancellationGeneration")
 
-            renewer = _LeaseRenewer(
+            cancellation_scope = CancellationScope()
+            renewer = _LeaseController(
                 client=client,
                 task_id=task_id,
                 executor_type=worker_config.executor_type,
                 lease_token=lease_token,
                 visibility_timeout_seconds=worker_config.visibility_timeout_seconds,
                 interval_seconds=worker_config.lease_renew_interval_seconds,
+                command_poll_interval_seconds=worker_config.command_poll_interval_seconds,
+                initial_fence_token=fence_token,
+                initial_cancellation_generation=cancellation_generation,
+                cancellation_scope=cancellation_scope,
             )
             renewer.start()
+
+            def acknowledge_cancellation(exc: TaskCancellationRequested) -> None:
+                if not cancellation_scope.wait_for_teardown(2.0):
+                    raise AilliumCoreClientError(
+                        "executor cancellation teardown was not confirmed"
+                    ) from cancellation_scope.teardown_error
+                command = exc.command
+                client.report_executor_status(
+                    execution_ref=execution_ref,
+                    executor_type=worker_config.executor_type,
+                    status="executor_cancelled",
+                    trace_id=trace_id,
+                    lease_token=lease_token,
+                    task_id=task_id,
+                    fence_token=command.fence_token,
+                    cancellation_generation=command.cancellation_generation,
+                )
+
             try:
+                # Start command polling immediately after claim, before Core
+                # releases task content. This closes the cancel-vs-payload race.
+                task_payload = client.fetch_task_payload(
+                    task_id=task_id,
+                    lease_token=lease_token,
+                )
+                task = {
+                    **task,
+                    "payload": task_payload.get("payload"),
+                    "conversationKey": task_payload.get("conversationKey"),
+                }
+
                 # Step 3: Report executor_started
                 client.report_executor_status(
                     execution_ref=execution_ref,
@@ -452,6 +618,7 @@ def run_polling_loop(
                     worker_context,
                     worker_config.worker_id,
                     lease_checkpoint=renewer.assert_active,
+                    cancellation_scope=cancellation_scope,
                 )
                 renewer.assert_active()
 
@@ -476,6 +643,13 @@ def run_polling_loop(
                     task_id=task_id,
                     artifacts=artifacts if artifacts else None,
                 )
+            except AilliumCoreLeaseFencedError:
+                try:
+                    renewer.synchronize_after_fence()
+                except TaskCancellationRequested as exc:
+                    acknowledge_cancellation(exc)
+            except TaskCancellationRequested as exc:
+                acknowledge_cancellation(exc)
             finally:
                 renewer.stop()
         except AilliumCoreRetryableError:

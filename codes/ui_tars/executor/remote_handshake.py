@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -9,6 +10,7 @@ from jsonschema import Draft202012Validator
 
 from .meshcentral_client import MeshCentralClient
 from .meshcentral_mock import MockMeshCentralClient
+from .cancellation import CancellationScope, TaskCancellationRequested
 
 
 class RemoteHandshakeValidationError(ValueError):
@@ -48,6 +50,8 @@ def _assert_lease(checkpoint: Callable[[], None] | None) -> None:
         return
     try:
         checkpoint()
+    except TaskCancellationRequested:
+        raise
     except Exception as exc:
         raise RemoteHandshakeLeaseLostError(str(exc)) from exc
 
@@ -95,6 +99,7 @@ def execute_remote_handshake(
     headers: dict[str, str],
     client: MeshCentralClient | None = None,
     lease_checkpoint: Callable[[], None] | None = None,
+    cancellation_scope: CancellationScope | None = None,
 ) -> dict[str, Any]:
     # Validate against canonical executor.request schema
     request_validator.validate(request_payload)
@@ -122,6 +127,30 @@ def execute_remote_handshake(
     mesh_node_id = mesh_node_id.strip()
 
     handshake_client = _select_meshcentral_client(client)
+    close_lock = threading.Lock()
+    session_closed = False
+
+    def close_once(*, cancelled: bool = False) -> None:
+        nonlocal session_closed
+        with close_lock:
+            if session_closed:
+                return
+            cancel_session = (
+                getattr(handshake_client, "cancel_session", None)
+                if cancelled
+                else None
+            )
+            if cancel_session is not None and callable(cancel_session):
+                cancel_session(mesh_node_id)
+            else:
+                handshake_client.close_session(mesh_node_id)
+            session_closed = True
+
+    unregister_teardown = (
+        cancellation_scope.register_teardown(lambda: close_once(cancelled=True))
+        if cancellation_scope is not None
+        else lambda: None
+    )
 
     started_at = _now()
     status = "succeeded"
@@ -221,7 +250,7 @@ def execute_remote_handshake(
 
     finally:
         try:
-            handshake_client.close_session(mesh_node_id)
+            close_once()
             logs.append(
                 {
                     "step": "handshake_close",
@@ -249,6 +278,8 @@ def execute_remote_handshake(
                     "mesh_node_id": mesh_node_id,
                 }
             )
+        finally:
+            unregister_teardown()
 
     finished_at = _now()
     duration_ms = int((finished_at - started_at).total_seconds() * 1000)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from dataclasses import dataclass
 from typing import Any
 from urllib import error, parse, request
@@ -21,6 +22,9 @@ class MeshCentralConfig:
 class MeshCentralClient:
     def __init__(self, config: MeshCentralConfig | None = None):
         self._config = config or self._load_from_env()
+        # Cancellation acquires the same lock after the bounded in-flight
+        # request, then closes the server-side session before acknowledgement.
+        self._operation_lock = threading.Lock()
 
     @staticmethod
     def _load_from_env() -> MeshCentralConfig:
@@ -44,7 +48,14 @@ class MeshCentralClient:
 
         return MeshCentralConfig(base_url=base_url, api_key=api_key, timeout_seconds=timeout_seconds)
 
-    def _request(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> Any:
         url = f"{self._config.base_url}{path}"
         data = None
         headers = {
@@ -56,15 +67,27 @@ class MeshCentralClient:
             headers["Content-Type"] = "application/json"
 
         req = request.Request(url=url, method=method.upper(), headers=headers, data=data)
+        # UI-TARS must be able to fence blocked remote calls and acknowledge
+        # teardown within two seconds. Serialising calls and bounding each I/O
+        # segment leaves time for a final session-close request.
+        timeout = min(
+            self._config.timeout_seconds,
+            timeout_seconds
+            if timeout_seconds is not None
+            else float(os.getenv("AILLIUM_CANCELLABLE_IO_TIMEOUT_SECONDS", "0.75")),
+            0.75,
+        )
         try:
-            with request.urlopen(req, timeout=self._config.timeout_seconds) as resp:
-                payload = resp.read()
-                content_type = resp.headers.get("Content-Type", "")
-                if "application/json" in content_type and payload:
-                    return json.loads(payload.decode("utf-8"))
-                if not payload:
-                    return {}
-                return {"raw": payload.decode("utf-8", errors="replace")}
+            with self._operation_lock:
+                response = request.urlopen(req, timeout=timeout)
+                with response as resp:
+                    payload = resp.read()
+                    content_type = resp.headers.get("Content-Type", "")
+                    if "application/json" in content_type and payload:
+                        return json.loads(payload.decode("utf-8"))
+                    if not payload:
+                        return {}
+                    return {"raw": payload.decode("utf-8", errors="replace")}
         except error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
             raise MeshCentralClientError(
@@ -96,3 +119,12 @@ class MeshCentralClient:
     def close_session(self, mesh_node_id: str) -> dict[str, Any]:
         node = parse.quote(mesh_node_id, safe="")
         return self._request("POST", f"/api/nodes/{node}/session/close")
+
+    def cancel_session(self, mesh_node_id: str) -> dict[str, Any]:
+        """Bounded teardown used by the cancellation acknowledgement path."""
+        node = parse.quote(mesh_node_id, safe="")
+        return self._request(
+            "POST",
+            f"/api/nodes/{node}/session/close",
+            timeout_seconds=0.75,
+        )

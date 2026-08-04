@@ -92,6 +92,7 @@ class ExecutorRemoteHandshakeTest(unittest.TestCase):
                 mc.close_session.assert_called_once_with("node-1")
         finally:
             server.shutdown()
+            server.server_close()
 
     def test_failure_still_calls_close_session(self):
         server, port = self._start_server()
@@ -115,6 +116,7 @@ class ExecutorRemoteHandshakeTest(unittest.TestCase):
                 mc.close_session.assert_called_once_with("node-1")
         finally:
             server.shutdown()
+            server.server_close()
 
     def test_missing_mesh_node_id_returns_400(self):
         server, port = self._start_server()
@@ -141,6 +143,7 @@ class ExecutorRemoteHandshakeTest(unittest.TestCase):
                 self.assertEqual(body["error"], "request_schema_validation_failed")
         finally:
             server.shutdown()
+            server.server_close()
 
 
 
@@ -163,6 +166,7 @@ class ExecutorRemoteHandshakeTest(unittest.TestCase):
                 self.assertEqual(body["error"], "endpoint_deprecated")
         finally:
             server.shutdown()
+            server.server_close()
 
 if __name__ == "__main__":
     unittest.main()

@@ -33,6 +33,12 @@ class AilliumCoreRetryableError(AilliumCoreClientError):
     pass
 
 
+class AilliumCoreLeaseFencedError(AilliumCoreClientError):
+    """Core rejected an operation because this lease attempt is fenced."""
+
+    pass
+
+
 @dataclass(frozen=True)
 class AilliumCoreConfig:
     base_url: str
@@ -124,12 +130,19 @@ class AilliumCoreClient:
                     "device not found in aillium-core"
                 ) from exc
 
+            if exc.code == 409:
+                detail = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+                raise AilliumCoreLeaseFencedError(
+                    f"aillium-core fenced executor lease method={method} "
+                    f"path={path} detail={detail}"
+                ) from exc
+
             detail = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
             raise AilliumCoreClientError(
                 f"aillium-core request failed status={exc.code} "
                 f"method={method} path={path} detail={detail}"
             ) from exc
-        except TimeoutError as exc:
+        except (TimeoutError, ConnectionResetError) as exc:
             raise AilliumCoreRetryableError("aillium-core request timed out") from exc
         except error.URLError as exc:
             raise AilliumCoreRetryableError(
@@ -246,6 +259,25 @@ class AilliumCoreClient:
             raise AilliumCoreClientError("lease renewal response must be a JSON object")
         return response
 
+    def poll_task_commands(
+        self,
+        *,
+        task_id: str,
+        executor_type: str,
+        lease_token: str,
+    ) -> dict[str, Any]:
+        """Read commands for this exact lease, including after it is revoked."""
+        task = parse.quote(task_id, safe="")
+        response = self._request(
+            "GET",
+            f"/v1/task-bus/tasks/{task}/commands",
+            query={"executorType": executor_type},
+            extra_headers={"X-Task-Lease-Token": lease_token},
+        )
+        if not isinstance(response, dict):
+            raise AilliumCoreClientError("task command response must be a JSON object")
+        return response
+
     def fetch_task_payload(self, *, task_id: str, lease_token: str) -> dict[str, Any]:
         """Fetch task data through Core's lease-bound worker endpoint."""
         task = parse.quote(task_id, safe="")
@@ -282,6 +314,8 @@ class AilliumCoreClient:
         lease_token: str,
         task_id: str | None = None,
         artifacts: list[dict[str, str]] | None = None,
+        fence_token: int | None = None,
+        cancellation_generation: int | None = None,
     ) -> dict[str, Any]:
         """Report executor status back to the task-bus.
 
@@ -306,6 +340,19 @@ class AilliumCoreClient:
         if artifacts:
             payload["artifacts"] = artifacts
 
+        if status == "executor_cancelled":
+            if task_id is None or fence_token is None or cancellation_generation is None:
+                raise AilliumCoreClientError(
+                    "executor_cancelled requires taskId, fenceToken, and cancellationGeneration"
+                )
+            payload.update(
+                {
+                    "taskId": task_id,
+                    "fenceToken": fence_token,
+                    "cancellationGeneration": cancellation_generation,
+                }
+            )
+
         response = self._request(
             "POST",
             "/v1/task-bus/executor-status",
@@ -320,6 +367,23 @@ class AilliumCoreClient:
             return {}
         if not isinstance(response, dict):
             raise AilliumCoreClientError("status report response must be a JSON object")
+        if status == "executor_cancelled":
+            expected = {
+                "taskId": task_id,
+                "executionRef": execution_ref,
+                "status": status,
+                "fenceToken": fence_token,
+                "cancellationGeneration": cancellation_generation,
+            }
+            if (
+                response.get("accepted") is not True
+                or response.get("acknowledged") is not True
+                or response.get("teardownComplete") is not True
+                or any(response.get(key) != value for key, value in expected.items())
+            ):
+                raise AilliumCoreClientError(
+                    "Core did not return an exact teardown acknowledgement"
+                )
         return response
 
     def submit_executor_result(self, task_id: str, result_payload: dict[str, Any]) -> dict[str, Any]:

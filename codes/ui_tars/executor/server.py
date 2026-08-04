@@ -32,9 +32,15 @@ class AppContext:
     response_schema: dict[str, Any]
 
 
-def _json_headers(handler: BaseHTTPRequestHandler, status: int) -> None:
+def _json_headers(
+    handler: BaseHTTPRequestHandler,
+    status: int,
+    content_length: int | None = None,
+) -> None:
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json")
+    if content_length is not None:
+        handler.send_header("Content-Length", str(content_length))
     handler.end_headers()
 
 
@@ -60,15 +66,18 @@ def create_handler(context: AppContext):
     class ExecutorHandler(BaseHTTPRequestHandler):
         def do_POST(self):  # noqa: N802
             if self.path in DEPRECATED_ENDPOINTS:
-                _json_headers(self, HTTPStatus.GONE)
-                self.wfile.write(
-                    json.dumps(
-                        {
-                            "error": "endpoint_deprecated",
-                            "message": DEPRECATED_ENDPOINTS[self.path],
-                        }
-                    ).encode("utf-8")
+                response_body = json.dumps(
+                    {
+                        "error": "endpoint_deprecated",
+                        "message": DEPRECATED_ENDPOINTS[self.path],
+                    }
+                ).encode("utf-8")
+                _json_headers(
+                    self,
+                    HTTPStatus.GONE,
+                    content_length=len(response_body),
                 )
+                self.wfile.write(response_body)
                 return
 
             if self.path not in {"/executor/dry-run", "/executor/remote-handshake"}:
